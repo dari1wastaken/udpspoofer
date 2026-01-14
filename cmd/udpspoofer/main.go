@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 
 	b64 "encoding/base64"
 	"encoding/binary"
@@ -39,24 +40,53 @@ func main() {
 			Name:  "subnet",
 			Usage: "Addresses to spoof",
 		},
+		cli.StringFlag{
+			Name:  "protocols",
+			Usage: "List of comma-separated protocols to send replies for. Supported: [tcp, udp]",
+		},
 	}
 
 	app.Action = func(c *cli.Context) error {
 		interfaceName := c.String("interface")
 		serverAddrStr := c.String("subnet")
-		synspoofing := true
+		synspoofing := false
+		udpspoofing := false
+
+		if serverAddrStr == "" {
+			log.Panic("Please provide a subnet to spoof...")
+		}
+
+		protoStr := c.String("protocols")
+		protocols := strings.Split(protoStr, ",")
 
 		connection, err := Connect()
 		if err != nil {
 			log.Fatalf("Couldnt establish connection to database: %v", err)
 		}
-		tcpQueue := make(chan TcpPacket, 10000)
-		go SaveTCPPackets(connection, tcpQueue)
-
 		fmt.Println("Database connection set up!")
 
-		if serverAddrStr == "" {
-			log.Panic("Please provide a subnet to spoof...")
+		// Init protocol channels and update packet filter
+
+		var tcpQueue chan TcpPacket
+		var udpQueue chan UdpPacket
+		var filter string = "inbound and net " + serverAddrStr
+
+		for _, proto := range protocols {
+			switch proto {
+			case "tcp":
+				synspoofing = true
+				tcpQueue := make(chan TcpPacket, 10000)
+				filter += " and (tcp[tcpflags] & tcp-fin) == 0 and (tcp[tcpflags] & tcp-rst) == 0"
+				go SaveTCPPackets(connection, tcpQueue)
+			case "udp":
+				// filter should already work
+				udpspoofing = true
+				udpQueue := make(chan UdpPacket, 10000)
+				go SaveUDPPackets(connection, udpQueue)
+			default:
+				log.Println(c.App.Usage)
+				log.Fatalf("protocol not supported: %s", proto)
+			}
 		}
 
 		// Open the network interface for packet capture
@@ -70,9 +100,7 @@ func main() {
 		packetQueue = make(chan []byte)
 		go sendthread(interfaceName, packetQueue)
 
-		// Create a packet capture filter
-		filter := "inbound and (tcp[tcpflags] & tcp-fin) == 0 and (tcp[tcpflags] & tcp-rst) == 0 and net " + serverAddrStr
-
+		fmt.Printf("BPF filter: %s\n", filter)
 		err = handle.SetBPFFilter(filter)
 		if err != nil {
 			log.Fatalf("Error setting BPF filter: %v", err)
@@ -80,16 +108,27 @@ func main() {
 
 		fmt.Printf("Listening on interface: %s\n", interfaceName)
 
-		// Make the TCP thread a loop for if it ever fails
+		// Make the thread loop infinitely in case it ever fails
 		for {
 			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
 
-				if synspoofing {
-					SendSYNACK(packet, packetQueue)
+				transport := packet.TransportLayer()
+				switch transport.LayerType() {
+				case layers.LayerTypeTCP:
+					if synspoofing {
+						SendSYNACK(packet, packetQueue)
+					}
+				case layers.LayerTypeUDP:
+					if udpspoofing {
+						SendUDPReply(packet, packetQueue)
+					}
+				default:
+					// TODO: save them?
+					continue
 				}
-				savePackets(packet, tcpQueue)
+				savePackets(packet, tcpQueue, udpQueue)
 			}
 		}
 	}
@@ -101,7 +140,7 @@ func main() {
 }
 
 // Save to DB - This code you probably do not really need to touch, it is specific to our DB.
-func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket)) {
+func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue chan (UdpPacket)) {
 	timestamp := packet.Metadata().Timestamp.Unix() * 1000
 	// Get IP layer
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
@@ -125,6 +164,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket)) {
 
 		// Let's see the type of the packet
 		tcpLayer := packet.Layer(layers.LayerTypeTCP)
+		udpLayer := packet.Layer(layers.LayerTypeUDP)
 
 		if tcpLayer != nil {
 			tcp, _ := tcpLayer.(*layers.TCP)
@@ -157,6 +197,23 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket)) {
 			tcppacket.Payload = b64.StdEncoding.EncodeToString(tcp.Payload)
 
 			tcpQueue <- tcppacket
+
+		} else if udpLayer != nil {
+			udp, _ := udpLayer.(*layers.UDP)
+
+			var udppacket UdpPacket
+
+			// Save IP header to packet
+			udppacket.IpPacket = ippacket
+
+			// Save TCP header to Packet
+			udppacket.SrcPort = uint16(udp.SrcPort)
+			udppacket.DstPort = uint16(udp.DstPort)
+			udppacket.Checksum = udp.Checksum
+
+			udppacket.Payload = b64.StdEncoding.EncodeToString(udp.Payload)
+
+			udpQueue <- udppacket
 		}
 	}
 }
@@ -256,7 +313,7 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 				ipLayer,
 				tcpLayer,
 			); err != nil {
-				log.Printf("Error serializing packet: %c", err)
+				log.Printf("Error serializing packet: %c\n", err)
 				return
 			}
 
@@ -305,6 +362,109 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 				tcpLayer,
 			); err != nil {
 				log.Printf("Error serializing packet: %c", err)
+				return
+			}
+
+			packetQueue <- buffer.Bytes()
+		}
+	}
+}
+
+// Take the incoming UDP packet, and reply with the values from the packet.
+func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte) {
+	tcpLay := packet.Layer(layers.LayerTypeTCP)
+	if tcpLay != nil {
+		tcp, _ := tcpLay.(*layers.TCP)
+		if tcp.SYN && !tcp.ACK {
+
+			ipLay := packet.Layer(layers.LayerTypeIPv4)
+			ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
+			if ethernetLayer == nil || ipLay == nil {
+				return
+			}
+			ethernet, _ := ethernetLayer.(*layers.Ethernet)
+			ip, _ := ipLay.(*layers.IPv4)
+
+			ethLayer := &layers.Ethernet{
+				SrcMAC:       ethernet.DstMAC,
+				DstMAC:       ethernet.SrcMAC,
+				EthernetType: layers.EthernetTypeIPv4,
+			}
+
+			ipLayer := &layers.IPv4{
+				Version:  4,
+				SrcIP:    ip.DstIP,
+				DstIP:    ip.SrcIP,
+				Protocol: layers.IPProtocolTCP,
+				Id:       uint16(rand.Intn(65536)),
+				TTL:      255,
+			}
+			tcpLayer := &layers.TCP{
+				SrcPort: tcp.DstPort,
+				DstPort: tcp.SrcPort,
+				Seq:     tcp.Ack,
+				Ack:     tcp.Seq + 1,
+				SYN:     true,
+				ACK:     true,
+				Window:  14600,
+			}
+			tcpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+			buffer := gopacket.NewSerializeBuffer()
+			if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true},
+				ethLayer,
+				ipLayer,
+				tcpLayer,
+			); err != nil {
+				log.Printf("Error serializing packet: %c", err)
+				return
+			}
+
+			packetQueue <- buffer.Bytes()
+		}
+
+		if !tcp.SYN && tcp.ACK {
+
+			ipLay := packet.Layer(layers.LayerTypeIPv4)
+			ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
+			if ethernetLayer == nil || ipLay == nil {
+				return
+			}
+			ethernet, _ := ethernetLayer.(*layers.Ethernet)
+			ip, _ := ipLay.(*layers.IPv4)
+
+			ethLayer := &layers.Ethernet{
+				SrcMAC:       ethernet.DstMAC,
+				DstMAC:       ethernet.SrcMAC,
+				EthernetType: layers.EthernetTypeIPv4,
+			}
+
+			ipLayer := &layers.IPv4{
+				Version:  4,
+				SrcIP:    ip.DstIP,
+				DstIP:    ip.SrcIP,
+				Protocol: layers.IPProtocolTCP,
+				Id:       uint16(rand.Intn(65536)),
+				TTL:      255,
+			}
+			tcpLayer := &layers.TCP{
+				SrcPort: tcp.DstPort,
+				DstPort: tcp.SrcPort,
+				Seq:     tcp.Ack,
+				Ack:     tcp.Seq + uint32(len(tcp.Payload)),
+				SYN:     false,
+				ACK:     true,
+				Window:  14600,
+			}
+			tcpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+			buffer := gopacket.NewSerializeBuffer()
+			if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true},
+				ethLayer,
+				ipLayer,
+				tcpLayer,
+			); err != nil {
+				log.Printf("Error serializing packet: %c\n", err)
 				return
 			}
 
@@ -415,13 +575,84 @@ type TcpPacket struct {
 	Payload                                    string
 }
 
-func prepareTCPBatch(conn driver.Conn) (driver.Batch, error) {
+type UdpPacket struct {
+	IpPacket
+	SrcPort, DstPort uint16
+	UDPLength        uint16
+	UDPChecksum      uint16
+	Payload          string
+}
+
+func prepareBatch(conn driver.Conn, table string) (driver.Batch, error) {
 	ctx := context.Background()
-	return conn.PrepareBatch(ctx, "INSERT INTO tcppackets", driver.WithReleaseConnection())
+	header := fmt.Sprintf("INSERT INTO %s ", table)
+	return conn.PrepareBatch(ctx, header, driver.WithReleaseConnection())
+}
+
+func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
+	udpbatch, err := prepareBatch(conn, "udppackets")
+	if err != nil {
+		log.Panic(err)
+	}
+
+	fmt.Println("UDP batch created...")
+
+	udppackets := 0
+	save := false
+	for {
+		if udppackets >= 50000 || save {
+			fmt.Println("Saving packets to database...")
+			err = udpbatch.Send()
+			if err != nil {
+				fmt.Println(err)
+			}
+			udpbatch, err = prepareBatch(conn, "udppackets")
+			if err != nil {
+				fmt.Println(err)
+			}
+			udppackets = 0
+			save = false
+		}
+
+		// Blocking call to recieve from the queue
+		packet := <-udpQueue
+		if packet.Flush {
+			save = true
+			continue
+		}
+		err = udpbatch.Append(
+			packet.Timestamp,
+			// IP Header
+			packet.SrcIP,
+			packet.DstIP,
+			packet.IHL,
+			packet.TOS,
+			packet.Length,
+			packet.IpId,
+			packet.Flags,
+			packet.FragOffset,
+			packet.TTL,
+			packet.Protocol,
+			// REMOVED Checksum due to compression
+			// packet.Checksum,
+
+			//Start of the UDP header
+			packet.SrcPort,
+			packet.DstPort,
+			packet.UDPLength,
+			// packet.UDPChecksum,
+
+			packet.Payload,
+		)
+		if err != nil {
+			fmt.Println("ERROR in batching UDPPacket: " + err.Error())
+		}
+		udppackets++
+	}
 }
 
 func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
-	tcpbatch, err := prepareTCPBatch(conn)
+	tcpbatch, err := prepareBatch(conn, "tcppackets")
 	if err != nil {
 		log.Panic(err)
 	}
@@ -437,7 +668,7 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
 			if err != nil {
 				fmt.Println(err)
 			}
-			tcpbatch, err = prepareTCPBatch(conn)
+			tcpbatch, err = prepareBatch(conn, "tcppackets")
 			if err != nil {
 				fmt.Println(err)
 			}
