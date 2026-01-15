@@ -110,6 +110,10 @@ func main() {
 
 		// Make the thread loop infinitely in case it ever fails
 		for {
+
+			// Init rate limiter
+			udpLimiter := NewUdpRateLimiter()
+
 			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
@@ -126,7 +130,7 @@ func main() {
 						}
 					case layers.LayerTypeUDP:
 						if udpspoofing {
-							SendUDPReply(packet, packetQueue)
+							SendUDPReply(packet, packetQueue, udpLimiter)
 						}
 					default:
 						// TODO: save them?
@@ -377,58 +381,67 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 
 // Take the incoming UDP packet, and reply with the values from the packet.
 // Assumes packet is IPv4
-func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte) {
+func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLimiter) {
+
 	udpLay := packet.Layer(layers.LayerTypeUDP)
-	if udpLay != nil {
-		udp, _ := udpLay.(*layers.UDP)
-
-		ipLay := packet.Layer(layers.LayerTypeIPv4)
-		ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
-		if ethernetLayer == nil || ipLay == nil {
-			return
-		}
-		ethernet, _ := ethernetLayer.(*layers.Ethernet)
-		ip, _ := ipLay.(*layers.IPv4)
-
-		ethLayer := &layers.Ethernet{
-			SrcMAC:       ethernet.DstMAC,
-			DstMAC:       ethernet.SrcMAC,
-			EthernetType: layers.EthernetTypeIPv4,
-		}
-
-		ipLayer := &layers.IPv4{
-			Version:  4,
-			SrcIP:    ip.DstIP,
-			DstIP:    ip.SrcIP,
-			Protocol: layers.IPProtocolUDP,
-			Id:       uint16(rand.Intn(65536)),
-			TTL:      255,
-		}
-
-		udpLayer := &layers.UDP{
-			SrcPort: udp.DstPort,
-			DstPort: udp.SrcPort,
-			Length:  uint16(8),
-		}
-		udpLayer.SetNetworkLayerForChecksum(ipLayer)
-
-		buffer := gopacket.NewSerializeBuffer()
-		if err := gopacket.SerializeLayers(
-			buffer,
-			gopacket.SerializeOptions{
-				FixLengths:       true,
-				ComputeChecksums: true,
-			},
-			ethLayer,
-			ipLayer,
-			udpLayer,
-		); err != nil {
-			log.Printf("Error serializing packet: %c\n", err)
-			return
-		}
-
-		packetQueue <- buffer.Bytes()
+	ipLay := packet.Layer(layers.LayerTypeIPv4)
+	if udpLay == nil || ipLay == nil {
+		return
 	}
+
+	ip, _ := ipLay.(*layers.IPv4)
+
+	// AmpPot-style rate limit
+	if !rl.Allow(ip.SrcIP) {
+		return
+	}
+
+	udp, _ := udpLay.(*layers.UDP)
+
+	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
+	if ethernetLayer == nil || ipLay == nil {
+		return
+	}
+	ethernet, _ := ethernetLayer.(*layers.Ethernet)
+
+	ethLayer := &layers.Ethernet{
+		SrcMAC:       ethernet.DstMAC,
+		DstMAC:       ethernet.SrcMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+
+	ipLayer := &layers.IPv4{
+		Version:  4,
+		SrcIP:    ip.DstIP,
+		DstIP:    ip.SrcIP,
+		Protocol: layers.IPProtocolUDP,
+		Id:       uint16(rand.Intn(65536)),
+		TTL:      255,
+	}
+
+	udpLayer := &layers.UDP{
+		SrcPort: udp.DstPort,
+		DstPort: udp.SrcPort,
+		Length:  uint16(8),
+	}
+	udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+	buffer := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(
+		buffer,
+		gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		},
+		ethLayer,
+		ipLayer,
+		udpLayer,
+	); err != nil {
+		log.Printf("Error serializing packet: %c\n", err)
+		return
+	}
+
+	packetQueue <- buffer.Bytes()
 
 }
 
