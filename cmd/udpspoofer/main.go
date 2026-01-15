@@ -2,16 +2,16 @@ package main
 
 import (
 	"context"
+	b64 "encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
-
-	b64 "encoding/base64"
-	"encoding/binary"
-	"encoding/json"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -65,8 +65,10 @@ func main() {
 		}
 		fmt.Println("Database connection set up!")
 
-		// Init protocol channels and update packet filter
+		// Load configurable channel size (default 10000)
+		channelSize := GetEnvInt("CHANNEL_SIZE", 10000)
 
+		// Init protocol channels and update packet filter
 		var tcpQueue chan TcpPacket
 		var udpQueue chan UdpPacket
 		var filter string = "inbound and net " + serverAddrStr
@@ -75,13 +77,13 @@ func main() {
 			switch proto {
 			case "tcp":
 				synspoofing = true
-				tcpQueue = make(chan TcpPacket, 10000)
+				tcpQueue = make(chan TcpPacket, channelSize)
 				filter += " and (tcp[tcpflags] & tcp-fin) == 0 and (tcp[tcpflags] & tcp-rst) == 0"
 				go SaveTCPPackets(connection, tcpQueue)
 			case "udp":
 				// filter should already work
 				udpspoofing = true
-				udpQueue = make(chan UdpPacket, 10000)
+				udpQueue = make(chan UdpPacket, channelSize)
 				go SaveUDPPackets(connection, udpQueue)
 			default:
 				log.Println(c.App.Usage)
@@ -97,7 +99,7 @@ func main() {
 		defer handle.Close()
 
 		// create outbound thread
-		packetQueue = make(chan []byte)
+		packetQueue = make(chan []byte, channelSize)
 		go sendthread(interfaceName, packetQueue)
 
 		fmt.Printf("BPF filter: %s\n", filter)
@@ -459,6 +461,19 @@ func GoDotEnvVariable(key string) string {
 	return os.Getenv(key)
 }
 
+// Get Env var as int with default fallback
+func GetEnvInt(key string, def int) int {
+	val := GoDotEnvVariable(key)
+	if val == "" {
+		return def
+	}
+	i, err := strconv.Atoi(val)
+	if err != nil {
+		return def
+	}
+	return i
+}
+
 // Function to connect to a Clickhouse database. NOTE: TLS is disabled at this moment. To allow for TLS, we should include this here.
 // It is running internally, so for now w/e
 func Connect() (driver.Conn, error) {
@@ -571,8 +586,12 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
 
 	udppackets := 0
 	save := false
+
+	// Load configurable batch size (default 50000)
+	batchSize := GetEnvInt("INSERT_BATCH_SIZE", 50000)
+
 	for {
-		if udppackets >= 50000 || save {
+		if udppackets >= batchSize || save {
 			fmt.Println("Saving packets to database...")
 			err = udpbatch.Send()
 			if err != nil {
@@ -633,8 +652,12 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
 
 	tcppackets := 0
 	save := false
+
+	// Load configurable batch size (default 50000)
+	batchSize := GetEnvInt("INSERT_BATCH_SIZE", 50000)
+
 	for {
-		if tcppackets >= 50000 || save {
+		if tcppackets >= batchSize || save {
 			fmt.Println("Saving packets to database...")
 			err = tcpbatch.Send()
 			if err != nil {
