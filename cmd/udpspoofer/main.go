@@ -114,21 +114,26 @@ func main() {
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
 
-				transport := packet.TransportLayer()
-				switch transport.LayerType() {
-				case layers.LayerTypeTCP:
-					if synspoofing {
-						SendSYNACK(packet, packetQueue)
+				// Only process IPv4
+				ipLayer := packet.Layer(layers.LayerTypeIPv4)
+				if ipLayer != nil {
+
+					transport := packet.TransportLayer()
+					switch transport.LayerType() {
+					case layers.LayerTypeTCP:
+						if synspoofing {
+							SendSYNACK(packet, packetQueue)
+						}
+					case layers.LayerTypeUDP:
+						if udpspoofing {
+							SendUDPReply(packet, packetQueue)
+						}
+					default:
+						// TODO: save them?
+						continue
 					}
-				case layers.LayerTypeUDP:
-					if udpspoofing {
-						SendUDPReply(packet, packetQueue)
-					}
-				default:
-					// TODO: save them?
-					continue
+					savePackets(packet, tcpQueue, udpQueue)
 				}
-				savePackets(packet, tcpQueue, udpQueue)
 			}
 		}
 	}
@@ -371,106 +376,60 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 }
 
 // Take the incoming UDP packet, and reply with the values from the packet.
+// Assumes packet is IPv4
 func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte) {
-	tcpLay := packet.Layer(layers.LayerTypeTCP)
-	if tcpLay != nil {
-		tcp, _ := tcpLay.(*layers.TCP)
-		if tcp.SYN && !tcp.ACK {
+	udpLay := packet.Layer(layers.LayerTypeUDP)
+	if udpLay != nil {
+		udp, _ := udpLay.(*layers.UDP)
 
-			ipLay := packet.Layer(layers.LayerTypeIPv4)
-			ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
-			if ethernetLayer == nil || ipLay == nil {
-				return
-			}
-			ethernet, _ := ethernetLayer.(*layers.Ethernet)
-			ip, _ := ipLay.(*layers.IPv4)
+		ipLay := packet.Layer(layers.LayerTypeIPv4)
+		ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
+		if ethernetLayer == nil || ipLay == nil {
+			return
+		}
+		ethernet, _ := ethernetLayer.(*layers.Ethernet)
+		ip, _ := ipLay.(*layers.IPv4)
 
-			ethLayer := &layers.Ethernet{
-				SrcMAC:       ethernet.DstMAC,
-				DstMAC:       ethernet.SrcMAC,
-				EthernetType: layers.EthernetTypeIPv4,
-			}
-
-			ipLayer := &layers.IPv4{
-				Version:  4,
-				SrcIP:    ip.DstIP,
-				DstIP:    ip.SrcIP,
-				Protocol: layers.IPProtocolTCP,
-				Id:       uint16(rand.Intn(65536)),
-				TTL:      255,
-			}
-			tcpLayer := &layers.TCP{
-				SrcPort: tcp.DstPort,
-				DstPort: tcp.SrcPort,
-				Seq:     tcp.Ack,
-				Ack:     tcp.Seq + 1,
-				SYN:     true,
-				ACK:     true,
-				Window:  14600,
-			}
-			tcpLayer.SetNetworkLayerForChecksum(ipLayer)
-
-			buffer := gopacket.NewSerializeBuffer()
-			if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true},
-				ethLayer,
-				ipLayer,
-				tcpLayer,
-			); err != nil {
-				log.Printf("Error serializing packet: %c", err)
-				return
-			}
-
-			packetQueue <- buffer.Bytes()
+		ethLayer := &layers.Ethernet{
+			SrcMAC:       ethernet.DstMAC,
+			DstMAC:       ethernet.SrcMAC,
+			EthernetType: layers.EthernetTypeIPv4,
 		}
 
-		if !tcp.SYN && tcp.ACK {
-
-			ipLay := packet.Layer(layers.LayerTypeIPv4)
-			ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
-			if ethernetLayer == nil || ipLay == nil {
-				return
-			}
-			ethernet, _ := ethernetLayer.(*layers.Ethernet)
-			ip, _ := ipLay.(*layers.IPv4)
-
-			ethLayer := &layers.Ethernet{
-				SrcMAC:       ethernet.DstMAC,
-				DstMAC:       ethernet.SrcMAC,
-				EthernetType: layers.EthernetTypeIPv4,
-			}
-
-			ipLayer := &layers.IPv4{
-				Version:  4,
-				SrcIP:    ip.DstIP,
-				DstIP:    ip.SrcIP,
-				Protocol: layers.IPProtocolTCP,
-				Id:       uint16(rand.Intn(65536)),
-				TTL:      255,
-			}
-			tcpLayer := &layers.TCP{
-				SrcPort: tcp.DstPort,
-				DstPort: tcp.SrcPort,
-				Seq:     tcp.Ack,
-				Ack:     tcp.Seq + uint32(len(tcp.Payload)),
-				SYN:     false,
-				ACK:     true,
-				Window:  14600,
-			}
-			tcpLayer.SetNetworkLayerForChecksum(ipLayer)
-
-			buffer := gopacket.NewSerializeBuffer()
-			if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true},
-				ethLayer,
-				ipLayer,
-				tcpLayer,
-			); err != nil {
-				log.Printf("Error serializing packet: %c\n", err)
-				return
-			}
-
-			packetQueue <- buffer.Bytes()
+		ipLayer := &layers.IPv4{
+			Version:  4,
+			SrcIP:    ip.DstIP,
+			DstIP:    ip.SrcIP,
+			Protocol: layers.IPProtocolUDP,
+			Id:       uint16(rand.Intn(65536)),
+			TTL:      255,
 		}
+
+		udpLayer := &layers.UDP{
+			SrcPort: udp.DstPort,
+			DstPort: udp.SrcPort,
+			Length:  uint16(8),
+		}
+		udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+		buffer := gopacket.NewSerializeBuffer()
+		if err := gopacket.SerializeLayers(
+			buffer,
+			gopacket.SerializeOptions{
+				FixLengths:       true,
+				ComputeChecksums: true,
+			},
+			ethLayer,
+			ipLayer,
+			udpLayer,
+		); err != nil {
+			log.Printf("Error serializing packet: %c\n", err)
+			return
+		}
+
+		packetQueue <- buffer.Bytes()
 	}
+
 }
 
 // use godot package to load/read the .env file and
