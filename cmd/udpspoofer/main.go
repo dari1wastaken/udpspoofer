@@ -75,13 +75,13 @@ func main() {
 			switch proto {
 			case "tcp":
 				synspoofing = true
-				tcpQueue := make(chan TcpPacket, 10000)
+				tcpQueue = make(chan TcpPacket, 10000)
 				filter += " and (tcp[tcpflags] & tcp-fin) == 0 and (tcp[tcpflags] & tcp-rst) == 0"
 				go SaveTCPPackets(connection, tcpQueue)
 			case "udp":
 				// filter should already work
 				udpspoofing = true
-				udpQueue := make(chan UdpPacket, 10000)
+				udpQueue = make(chan UdpPacket, 10000)
 				go SaveUDPPackets(connection, udpQueue)
 			default:
 				log.Println(c.App.Usage)
