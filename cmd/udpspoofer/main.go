@@ -399,7 +399,7 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 	udp, _ := udpLay.(*layers.UDP)
 
 	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
-	if ethernetLayer == nil || ipLay == nil {
+	if ethernetLayer == nil {
 		return
 	}
 	ethernet, _ := ethernetLayer.(*layers.Ethernet)
