@@ -6,11 +6,12 @@ import (
 	"time"
 )
 
-const (
-	udpIPLimit     = 3
-	udpSubnetLimit = 30
-	udpWindow      = time.Minute
-	udpBlockTTL    = time.Hour
+// TODO: make config, update them and keep AmpPot defaults
+var (
+	udpWindow      = time.Duration(GetEnvInt("UDP_RL_WINDOW_MINUTES", 1)) * time.Minute
+	udpBlockTTL    = time.Duration(GetEnvInt("UDP_RL_BLOCK_TTL_MINUTES", 60)) * time.Minute
+	udpIPLimit     = GetEnvInt("UDP_IP_LIMIT", 3)
+	udpSubnetLimit = GetEnvInt("UDP_SUBNET_LIMIT", 30)
 )
 
 type rateEntry struct {
