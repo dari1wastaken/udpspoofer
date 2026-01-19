@@ -392,13 +392,12 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 	}
 
 	ip, _ := ipLay.(*layers.IPv4)
+	udp, _ := udpLay.(*layers.UDP)
 
 	// AmpPot-style rate limit
-	if !rl.Allow(ip.SrcIP) {
+	if !rl.Allow(ip.SrcIP, ip.DstIP, uint16(udp.DstPort)) {
 		return
 	}
-
-	udp, _ := udpLay.(*layers.UDP)
 
 	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
 	if ethernetLayer == nil {
