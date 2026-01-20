@@ -140,7 +140,6 @@ func main() {
 
 			// Init rate limiter
 			udpLimiter := NewUdpRateLimiter()
-			udp_ctr := 0
 
 			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
@@ -157,11 +156,6 @@ func main() {
 							SendSYNACK(packet, packetQueue)
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-						logger.Debug().Msg("New UDP")
-						udp_ctr += 1
-						if udp_ctr%100 == 0 {
-							logger.Info().Int("udp_ctr", udp_ctr).Msg("Received 100 udp packets")
-						}
 						if udpspoofing {
 							SendUDPReply(packet, packetQueue, udpLimiter)
 						}
