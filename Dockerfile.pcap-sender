@@ -1,0 +1,13 @@
+# Simple sender that reads pcap via pcapgo (no libpcap needed)
+FROM golang:1.25-alpine AS build
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/pcap-sender ./cmd/pcap-sender
+RUN go build -o pcap-sender ./cmd/pcap-sender
+
+FROM alpine:3.20
+WORKDIR /app
+COPY --from=build /app/pcap-sender /app/pcap-sender
+RUN apk add tcpdump
+ENTRYPOINT ["sleep", "infinity"]

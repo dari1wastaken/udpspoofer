@@ -1,0 +1,17 @@
+# Build and run udpspoofer with libpcap available
+FROM golang:1.25-alpine AS build
+RUN apk add --no-cache build-base libpcap-dev
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# CGO is required for libpcap
+RUN CGO_ENABLED=1 go build -o udpspoofer ./cmd/udpspoofer
+
+FROM alpine:3.20
+RUN apk add --no-cache libpcap
+WORKDIR /app
+COPY --from=build /app/udpspoofer /app/udpspoofer
+RUN apk add tcpdump
+# .env will be mounted by docker-compose (docker.env -> /app/.env)
+ENTRYPOINT ["sleep", "infinity"]

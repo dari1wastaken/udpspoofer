@@ -71,18 +71,21 @@ func (r *UdpRateLimiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 	// IP rate
 	if !r.bump(r.ipRates, src, udpIPLimit, now) {
 		r.blockedIP[src] = &blockEntry{until: now.Add(udpBlockTTL)}
+		logger.Debug().Str("src_ip", srcIP.String()).Msg("blocking Source IP")
 		return false
 	}
 
 	// /24 rate
 	if !r.bump(r.subRates, subnet, udpSubnetLimit, now) {
 		r.blocked24[subnet] = &blockEntry{until: now.Add(udpBlockTTL)}
+		logger.Debug().Str("src_net", srcIP.String()).Msg("blocking Source /24")
 		return false
 	}
 
 	// Endpoint Rate
 	if !r.bump(r.epRates, dst, udpEndpointLimit, now) {
 		r.blockedEndpoints[dst] = &blockEntry{until: now.Add(udpBlockTTL)}
+		logger.Debug().Str("dst_ip", dstIP.String()).Int16("dst_port", int16(dstPort)).Msg("blocking Endpoint")
 		return false
 	}
 

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -20,8 +19,12 @@ import (
 	"github.com/google/gopacket/pcap"
 	"github.com/joho/godotenv"
 	"github.com/urfave/cli"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
+var logger zerolog.Logger
 var packetQueue chan []byte
 
 const MaxPacketSize = 65536 // Maximum packet size
@@ -47,13 +50,17 @@ func main() {
 	}
 
 	app.Action = func(c *cli.Context) error {
+
+		log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger().Level(zerolog.DebugLevel)
+		logger = log.Logger
+
 		interfaceName := c.String("interface")
 		serverAddrStr := c.String("subnet")
 		synspoofing := false
 		udpspoofing := false
 
 		if serverAddrStr == "" {
-			log.Panic("Please provide a subnet to spoof...")
+			logger.Fatal().Msg("Please provide a subnet to spoof...")
 		}
 
 		protoStr := c.String("protocols")
@@ -61,11 +68,11 @@ func main() {
 
 		connection, err := Connect()
 		if err != nil {
-			log.Fatalf("Couldnt establish connection to database: %v", err)
+			logger.Fatal().Err(err).Msg("Couldnt establish connection to database")
 		}
-		fmt.Println("Database connection set up!")
+		logger.Info().Msg("Database connection set up!")
 
-		// Load configurable channel size (default 10000)
+		// Load configurable channel size
 		channelSize := GetEnvInt("CHANNEL_SIZE", 10000)
 
 		// Init protocol channels and update packet filter
@@ -86,15 +93,15 @@ func main() {
 				udpQueue = make(chan UdpPacket, channelSize)
 				go SaveUDPPackets(connection, udpQueue)
 			default:
-				log.Println(c.App.Usage)
-				log.Fatalf("protocol not supported: %s", proto)
+				logger.Warn().Msg(c.App.Usage)
+				logger.Fatal().Str("protocol", proto).Msg("protocol not supported")
 			}
 		}
 
 		// Open the network interface for packet capture
 		handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
 		if err != nil {
-			log.Fatalf("Error opening interface: %v", err)
+			logger.Fatal().Err(err)
 		}
 		defer handle.Close()
 
@@ -102,19 +109,20 @@ func main() {
 		packetQueue = make(chan []byte, channelSize)
 		go sendthread(interfaceName, packetQueue)
 
-		fmt.Printf("BPF filter: %s\n", filter)
+		logger.Info().Str("filter", filter).Msg("set bpf filter")
 		err = handle.SetBPFFilter(filter)
 		if err != nil {
-			log.Fatalf("Error setting BPF filter: %v", err)
+			logger.Fatal().Err(err)
 		}
 
-		fmt.Printf("Listening on interface: %s\n", interfaceName)
+		logger.Info().Str("interface", interfaceName).Msg("Listening on interface")
 
 		// Make the thread loop infinitely in case it ever fails
 		for {
 
 			// Init rate limiter
 			udpLimiter := NewUdpRateLimiter()
+			udp_ctr := 0
 
 			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
@@ -124,20 +132,23 @@ func main() {
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
 
-					transport := packet.TransportLayer()
-					switch transport.LayerType() {
-					case layers.LayerTypeTCP:
+					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 						if synspoofing {
 							SendSYNACK(packet, packetQueue)
 						}
-					case layers.LayerTypeUDP:
+					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+						udp_ctr += 1
+						if udp_ctr%1000 == 0 {
+							logger.Info().Int("udp_ctr", udp_ctr).Msg("Received 1000 udp packets")
+						}
 						if udpspoofing {
 							SendUDPReply(packet, packetQueue, udpLimiter)
 						}
-					default:
-						// TODO: save them?
+					} else {
+						// Not saving anything else for now
 						continue
 					}
+
 					savePackets(packet, tcpQueue, udpQueue)
 				}
 			}
@@ -146,7 +157,7 @@ func main() {
 
 	err := app.Run(os.Args)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal().Err(err)
 	}
 }
 
@@ -174,10 +185,8 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 		ippacket.Checksum = ip.Checksum
 
 		// Let's see the type of the packet
-		tcpLayer := packet.Layer(layers.LayerTypeTCP)
-		udpLayer := packet.Layer(layers.LayerTypeUDP)
 
-		if tcpLayer != nil {
+		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 			tcp, _ := tcpLayer.(*layers.TCP)
 
 			var tcppacket TcpPacket
@@ -209,7 +218,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 
 			tcpQueue <- tcppacket
 
-		} else if udpLayer != nil {
+		} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 			udp, _ := udpLayer.(*layers.UDP)
 
 			var udppacket UdpPacket
@@ -261,7 +270,7 @@ func sendthread(interfaceName string, packetQueue chan []byte) {
 	// Open the network interface for packet capture
 	handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
 	if err != nil {
-		log.Fatalf("Error opening interface: %v", err)
+		logger.Fatal().Err(err).Msg("sendthread: error opening interface")
 	}
 	defer handle.Close()
 
@@ -454,7 +463,7 @@ func GoDotEnvVariable(key string) string {
 	err := godotenv.Load(".env")
 
 	if err != nil {
-		log.Fatalf("Error loading .env file")
+		logger.Fatal().Err(err).Msg("Error loading .env file")
 	}
 
 	return os.Getenv(key)
@@ -578,10 +587,10 @@ func prepareBatch(conn driver.Conn, table string) (driver.Batch, error) {
 func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
 	udpbatch, err := prepareBatch(conn, "udppackets")
 	if err != nil {
-		log.Panic(err)
+		logger.Fatal().Err(err).Msg("Error preparing UDP batch")
 	}
 
-	fmt.Println("UDP batch created...")
+	logger.Info().Msg("UDP batch created...")
 
 	udppackets := 0
 	save := false
@@ -644,7 +653,7 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
 func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
 	tcpbatch, err := prepareBatch(conn, "tcppackets")
 	if err != nil {
-		log.Panic(err)
+		logger.Fatal().Err(err).Msg("Error preparing TCP batch")
 	}
 
 	fmt.Println("TCP batch created...")
