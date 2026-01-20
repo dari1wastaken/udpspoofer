@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -51,7 +52,24 @@ func main() {
 
 	app.Action = func(c *cli.Context) error {
 
-		log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger().Level(zerolog.DebugLevel)
+		zerolog.TimeFieldFormat = time.RFC3339Nano
+		var level zerolog.Level
+		switch strings.ToLower(GoDotEnvVariable("LOG_LEVEL")) {
+		case "debug":
+			level = zerolog.DebugLevel
+		case "info":
+			level = zerolog.InfoLevel
+		case "warn":
+			level = zerolog.WarnLevel
+		case "error":
+			level = zerolog.ErrorLevel
+		case "trace":
+			level = zerolog.TraceLevel
+		default:
+			level = zerolog.InfoLevel
+		}
+
+		log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger().Level(level)
 		logger = log.Logger
 
 		interfaceName := c.String("interface")
@@ -128,6 +146,8 @@ func main() {
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
 
+				logger.Debug().Msg("New packet")
+
 				// Only process IPv4
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
@@ -137,9 +157,10 @@ func main() {
 							SendSYNACK(packet, packetQueue)
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+						logger.Debug().Msg("New UDP")
 						udp_ctr += 1
-						if udp_ctr%1000 == 0 {
-							logger.Info().Int("udp_ctr", udp_ctr).Msg("Received 1000 udp packets")
+						if udp_ctr%100 == 0 {
+							logger.Info().Int("udp_ctr", udp_ctr).Msg("Received 100 udp packets")
 						}
 						if udpspoofing {
 							SendUDPReply(packet, packetQueue, udpLimiter)
@@ -435,6 +456,12 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 		Length:  uint16(8),
 	}
 	udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+	logger.Debug().
+		Str("reply", fmt.Sprintf("%s:%d -> %s:%d",
+			ipLayer.SrcIP.String(), uint16(udpLayer.SrcPort),
+			ipLayer.DstIP.String(), uint16(udpLayer.DstPort))).
+		Msg("SendUDPReply")
 
 	buffer := gopacket.NewSerializeBuffer()
 	if err := gopacket.SerializeLayers(
