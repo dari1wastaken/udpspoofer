@@ -621,7 +621,7 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
 
 	for {
 		if udppackets >= batchSize || save {
-			fmt.Println("Saving packets to database...")
+			logger.Info().Str("proto", "udp").Int("batch_size", udppackets).Msg("saving batch to clickhouse")
 			err = udpbatch.Send()
 			if err != nil {
 				fmt.Println(err)
@@ -687,7 +687,7 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
 
 	for {
 		if tcppackets >= batchSize || save {
-			fmt.Println("Saving packets to database...")
+			logger.Info().Str("proto", "tcp").Int("batch_size", tcppackets).Msg("saving batch to clickhouse")
 			err = tcpbatch.Send()
 			if err != nil {
 				fmt.Println(err)
