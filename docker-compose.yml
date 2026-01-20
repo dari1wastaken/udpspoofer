@@ -24,17 +24,15 @@ services:
     container_name: udpspoofer
     depends_on:
       - clickhouse
-    # udpspoofer uses libpcap to capture and send raw frames
     cap_add:
       - NET_ADMIN
       - NET_RAW
     security_opt:
       - seccomp:unconfined
-    # Load Docker-specific env for DB host=clickhouse and sizing
     volumes:
       - ./docker.env:/app/.env:ro
-    # ./udpspoofer --interface eth0 --subnet 172.25.0.3/25 --protocols udp
-    # command: ["./udpspoofer", "--interface", "eth0", "--subnet", "172.25.0.3/25", "--protocols", "udp"]
+    # Example:
+    # command: ["./udpspoofer", "--interface", "eth0", "--subnet", "172.25.0.0/16", "--protocols", "udp"]
     networks:
       telescope-net:
         aliases:
@@ -47,11 +45,17 @@ services:
     container_name: pcap-sender
     depends_on:
       - udpspoofer
-    # Mount your test pcap here
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - ./testdata/input.pcap:/pcap/input.pcap:ro
-    # ./pcap-sender --pcap /pcap/input.pcap --dst-ip 172.25.0.5 --dst-port 9999 --pps 100
-    # command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "172.25.0.5", "--dst-port", "9999", "--pps", "100"]
+    # Non-spoof:
+    # command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "udpspoofer", "--dst-port", "9999", "--pps", "1000"]
+    # Spoofing (random src IP) on docker bridge:
+    command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "udpspoofer", "--dst-port", "9999", "--pps", "1000", "--spoof-srcip", "--iface", "eth0"]
     networks:
       telescope-net:
 

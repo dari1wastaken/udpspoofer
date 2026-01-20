@@ -1,13 +1,15 @@
-# Simple sender that reads pcap via pcapgo (no libpcap needed)
+# Build pcap-sender with libpcap for raw frame injection when spoofing is enabled
 FROM golang:1.25-alpine AS build
+RUN apk add --no-cache build-base libpcap-dev pkgconfig
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/pcap-sender ./cmd/pcap-sender
-RUN go build -o pcap-sender ./cmd/pcap-sender
+# CGO is required by gopacket/pcap
+RUN CGO_ENABLED=1 GOOS=linux go build -o pcap-sender ./cmd/pcap-sender
 
 FROM alpine:3.20
+RUN apk add --no-cache libpcap tcpdump
 WORKDIR /app
 COPY --from=build /app/pcap-sender /app/pcap-sender
-RUN apk add tcpdump
 ENTRYPOINT ["sleep", "infinity"]
