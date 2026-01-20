@@ -107,6 +107,7 @@ func (r *UdpRateLimiter) bump(m map[uint32]*rateEntry, key uint32, limit int, no
 }
 
 func (r *UdpRateLimiter) cleanupLoop() {
+	// TODO: we might want a separate interval for cleanups
 	ticker := time.NewTicker(time.Duration(GetEnvInt("UDP_RL_BLOCK_TTL_MINUTES", 5)) * time.Minute)
 	for range ticker.C {
 		now := time.Now()
