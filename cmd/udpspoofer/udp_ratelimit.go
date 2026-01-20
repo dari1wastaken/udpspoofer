@@ -49,21 +49,24 @@ func NewUdpRateLimiter() *UdpRateLimiter {
 }
 
 func (r *UdpRateLimiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
-	src := Ip2int(srcIP)
-	subnet := src & 0xFFFFFF00
-	dst := uint32(dstIP[2])<<24 | uint32(dstIP[3])<<16 | uint32(dstPort)
-	now := time.Now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	now := time.Now()
+
 	// Block check
+	src := Ip2int(srcIP)
 	if b, ok := r.blockedIP[src]; ok && now.Before(b.until) {
 		return false
 	}
+
+	subnet := src & 0xFFFFFF00
 	if b, ok := r.blocked24[subnet]; ok && now.Before(b.until) {
 		return false
 	}
+
+	dst := uint32(dstIP[2])<<24 | uint32(dstIP[3])<<16 | uint32(dstPort)
 	if b, ok := r.blockedEndpoints[dst]; ok && now.Before(b.until) {
 		return false
 	}
@@ -89,11 +92,15 @@ func (r *UdpRateLimiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 		return false
 	}
 
+	logger.Debug().Str("src_ip", srcIP.String()).Str("dst_ip", dstIP.String()).Uint16("dst_port", dstPort).Msg("packet allowed")
+
 	return true
 }
 
 func (r *UdpRateLimiter) bump(m map[uint32]*rateEntry, key uint32, limit int, now time.Time) bool {
 	e, ok := m[key]
+	logger.Debug().Uint32("key", key).Msg("bump")
+
 	if !ok || now.After(e.windowEnd) {
 		m[key] = &rateEntry{
 			count:     1,
@@ -108,9 +115,12 @@ func (r *UdpRateLimiter) bump(m map[uint32]*rateEntry, key uint32, limit int, no
 
 func (r *UdpRateLimiter) cleanupLoop() {
 	// TODO: we might want a separate interval for cleanups
-	ticker := time.NewTicker(time.Duration(GetEnvInt("UDP_RL_BLOCK_TTL_MINUTES", 5)) * time.Minute)
+	intervalMinutes := GetEnvInt("UDP_RL_BLOCK_TTL_MINUTES", 5)
+	ticker := time.NewTicker(time.Duration(intervalMinutes) * time.Minute)
+	logger.Info().Int("minutes", intervalMinutes).Msg("cleanup loop interval")
 	for range ticker.C {
 		now := time.Now()
+		logger.Info().Time("time", now).Msg("new cleanup loop")
 		r.mu.Lock()
 		for k, v := range r.blockedIP {
 			if now.After(v.until) {
