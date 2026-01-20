@@ -1,59 +1,56 @@
-# UDP Reactive Telescope - Containerized testing setup
+# UDP/TCP Reactive Telescope
 
-This setup creates:
-- A ClickHouse instance with test tables
-- A simple UDP pcap sender
-- The `udpspoofer` reactive telescope
+NOTE: docker compose setup is just for local testing. This includes the local dockerized clickhouse instance and the pcap-sender to simulate a scanner 
 
-## Prerequisites
+The `pcap-sender` supports `--spoof-srcip` to craft and inject raw Ethernet/IPv4/UDP frames with randomized source IPv4 addresses. Non-spoof mode keeps sending only UDP payloads via sockets.
 
-- Docker and docker-compose
-- A test pcap at `./testdata/input.pcap` containing UDP packets
+## udpspoofer 
 
-## Structure
+#### Build
 
-- `docker-compose.yml`: Orchestrates services
-- `clickhouse/init/01_schema.sql`: Initializes `test.udppackets` and `test.tcppackets`
-- `Dockerfile.udpspoofer`: Builds and runs the telescope
-- `Dockerfile.pcap-sender`: Builds the UDP pcap sender
-- `cmd/pcap-sender/main.go`: Sends UDP payloads from a pcap file
-- `docker.env`: Environment for `udpspoofer` in Docker
+Ignore the docker compose setup, just run `./build-linux.sh`
 
-## Usage
+#### Examples of usage
 
-1. Place your pcap at `./testdata/input.pcap`.
-2. Bring up the stack:
+```
+./udpspoofer --interface eth0 --subnet 172.25.0.3 --protocols udp
+./udpspoofer --interface eth0 --subnet 172.25.0.0/25 --protocols udp,tcp
+./udpspoofer --interface eth0 --subnet 172.25.0.3/24 --protocols tcp
+```
+
+#### Rate Limiting
+
+Per source IP, source /24, destination endpoint (ip:port)
+
+EXAMPLES
+- `src_ip` is blocked for `UDP_RL_BLOCK_TTL_MINUTES` if it sends us `UDP_IP_LIMIT` within `UDP_RL_WINDOW_MINUTES`
+- `src_24` is blocked for `UDP_RL_BLOCK_TTL_MINUTES` if it sends us `UDP_SUBNET_LIMIT` within `UDP_RL_WINDOW_MINUTES`
+- `dst_ip:dst_port` (from `--subnet`) is blocked for `UDP_RL_BLOCK_TTL_MINUTES` if it receives `UDP_ENDPOINT_LIMIT` within `UDP_RL_WINDOW_MINUTES`
+
+## Docker Testing Setup
+
+`docker-compose.yml` grants the necessary capabilities to `pcap-sender`. The default command demonstrates spoofing mode. ARP resolution is performed on the Docker bridge network to find the destination MAC for the `udpspoofer` service.
 
 ```bash
 docker compose up --build
 ```
 
-3. The sender will stream UDP payloads to the `udpspoofer` service. `udpspoofer` captures traffic on `eth0`, applies per-IP, /24, and per-endpoint rate limiting, reacts to UDP, and batches inserts into ClickHouse.
-4. Inspect data:
+Adjust the compose command or flags as needed.
 
+
+#### pcap-sender
+
+Non-spoofing (default):
 ```bash
-# HTTP UI
-http://localhost:8123
-
-# clickhouse-client (docker exec)
-docker exec -it clickhouse clickhouse-client \
-  --user test --password test \
-  --query "SELECT count() FROM test.udppackets"
+./pcap-sender --pcap input.pcap --dst-ip udpspoofer --dst-port 9999 --pps 1000
 ```
 
-## Configuration
+Spoofing (requires CAP_NET_RAW and CAP_NET_ADMIN):
+```bash
+./pcap-sender --pcap input.pcap --dst-ip udpspoofer --dst-port 9999 --pps 1000 --spoof-srcip --iface eth0
+```
 
-- `docker.env` supplies DB connection and batching/channel sizes for `udpspoofer`.
-- Network subnet is pinned to `172.25.0.0/16`. `udpspoofer` is invoked with:
-  - `--interface eth0`
-  - `--subnet 172.25.0.0/16`
-  - `--protocols udp`
-
-Adjust compose `command` or environment as needed.
-
-## Notes
-
-- `udpspoofer` uses libpcap and requires `NET_ADMIN` and `NET_RAW` capabilities to capture and send raw frames.
-- The pcap sender uses `pcapgo` to read the file and sends only UDP payloads to the destination host/port. It does not preserve original headers.
-- Table schemas match the current insertion fields (checksums omitted, TCP flags stored as UInt8).
-- For higher throughput, tune `CHANNEL_SIZE` and `INSERT_BATCH_SIZE` in `docker.env`, and the sender's `--pps` flag.
+Options:
+- `--src-port <port>`: override UDP source port used in spoofed packets (default uses source port from pcap)
+- `--pps <n>`: throttle sending to approx n packets per second
+- `--iface`: interface used for ARP and raw injection (default `eth0` inside container)
