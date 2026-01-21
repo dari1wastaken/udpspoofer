@@ -58,48 +58,55 @@ func (r *UdpRateLimiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 	// Block check
 	src := Ip2int(srcIP)
 	if b, ok := r.blockedIP[src]; ok && now.Before(b.until) {
+		logger.Debug().
+			Str("src_ip", srcIP.String()).
+			Msg("REASON srcIP blocked")
 		return false
 	}
 
 	subnet := src & 0xFFFFFF00
 	if b, ok := r.blocked24[subnet]; ok && now.Before(b.until) {
+		logger.Debug().
+			Str("subnet", srcIP.String()).
+			Msg("REASON subnet blocked")
 		return false
 	}
 
 	dst := uint32(dstIP[2])<<24 | uint32(dstIP[3])<<16 | uint32(dstPort)
 	if b, ok := r.blockedEndpoints[dst]; ok && now.Before(b.until) {
+		logger.Debug().
+			Str("dst_ip", dstIP.String()).
+			Uint16("dst_port", dstPort).
+			Msg("REASON endpoint blocked")
 		return false
 	}
 
 	// IP rate
 	if !r.bump(r.ipRates, src, udpIPLimit, now) {
 		r.blockedIP[src] = &blockEntry{until: now.Add(udpBlockTTL)}
-		logger.Info().Str("src_ip", srcIP.String()).Msg("blocking Source IP")
+		logger.Info().Str("src_ip", srcIP.String()).Msg("BLOCKING Source IP")
 		return false
 	}
 
 	// /24 rate
 	if !r.bump(r.subRates, subnet, udpSubnetLimit, now) {
 		r.blocked24[subnet] = &blockEntry{until: now.Add(udpBlockTTL)}
-		logger.Info().Str("src_net", srcIP.String()).Msg("blocking Source /24")
+		logger.Info().Str("src_net", srcIP.String()).Msg("BLOCKING Source /24")
 		return false
 	}
 
 	// Endpoint Rate
 	if !r.bump(r.epRates, dst, udpEndpointLimit, now) {
 		r.blockedEndpoints[dst] = &blockEntry{until: now.Add(udpBlockTTL)}
-		logger.Info().Str("dst_ip", dstIP.String()).Int16("dst_port", int16(dstPort)).Msg("blocking Endpoint")
+		logger.Info().Str("dst_ip", dstIP.String()).Int16("dst_port", int16(dstPort)).Msg("BLOCKING Endpoint")
 		return false
 	}
-
-	logger.Debug().Str("src_ip", srcIP.String()).Str("dst_ip", dstIP.String()).Uint16("dst_port", dstPort).Msg("packet allowed")
 
 	return true
 }
 
 func (r *UdpRateLimiter) bump(m map[uint32]*rateEntry, key uint32, limit int, now time.Time) bool {
 	e, ok := m[key]
-	logger.Debug().Uint32("key", key).Msg("bump")
 
 	if !ok || now.After(e.windowEnd) {
 		m[key] = &rateEntry{
@@ -120,20 +127,23 @@ func (r *UdpRateLimiter) cleanupLoop() {
 	logger.Info().Int("minutes", intervalMinutes).Msg("cleanup loop interval")
 	for range ticker.C {
 		now := time.Now()
-		logger.Info().Time("time", now).Msg("new cleanup loop")
+		logger.Info().Time("time", now).Msg("LOOP new cleanup")
 		r.mu.Lock()
 		for k, v := range r.blockedIP {
 			if now.After(v.until) {
+				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked IP")
 				delete(r.blockedIP, k)
 			}
 		}
 		for k, v := range r.blocked24 {
 			if now.After(v.until) {
+				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked Net")
 				delete(r.blocked24, k)
 			}
 		}
 		for k, v := range r.blockedEndpoints {
 			if now.After(v.until) {
+				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked EP")
 				delete(r.blockedEndpoints, k)
 			}
 		}

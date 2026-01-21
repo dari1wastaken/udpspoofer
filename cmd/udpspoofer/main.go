@@ -145,8 +145,6 @@ func main() {
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
 
-				logger.Debug().Msg("New packet")
-
 				// Only process IPv4
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
@@ -156,6 +154,7 @@ func main() {
 							SendSYNACK(packet, packetQueue)
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+						logger.Debug().Str("proto", "udp").Msg("IN new packet")
 						if udpspoofing {
 							SendUDPReply(packet, packetQueue, udpLimiter)
 						}
@@ -420,6 +419,10 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 
 	// AmpPot-style rate limit
 	if !rl.Allow(ip.SrcIP, ip.DstIP, uint16(udp.DstPort)) {
+		logger.Debug().
+			Str("src_ip", ip.SrcIP.String()).Str("dst_ip", ip.DstIP.String()).
+			Uint16("src_port", uint16(udp.SrcPort)).Uint16("dst_port", uint16(udp.DstPort)).
+			Msg("PACKET BLOCKED")
 		return
 	}
 
@@ -451,12 +454,6 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 	}
 	udpLayer.SetNetworkLayerForChecksum(ipLayer)
 
-	logger.Debug().
-		Str("reply", fmt.Sprintf("%s:%d -> %s:%d",
-			ipLayer.SrcIP.String(), uint16(udpLayer.SrcPort),
-			ipLayer.DstIP.String(), uint16(udpLayer.DstPort))).
-		Msg("SendUDPReply")
-
 	buffer := gopacket.NewSerializeBuffer()
 	if err := gopacket.SerializeLayers(
 		buffer,
@@ -471,6 +468,11 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 		log.Printf("Error serializing packet: %c\n", err)
 		return
 	}
+
+	logger.Debug().
+		Str("src_ip", ipLayer.SrcIP.String()).Str("dst_ip", ipLayer.DstIP.String()).
+		Uint16("src_port", uint16(udpLayer.SrcPort)).Uint16("dst_port", uint16(udpLayer.DstPort)).
+		Msg("REPLY send")
 
 	packetQueue <- buffer.Bytes()
 
