@@ -75,14 +75,17 @@ func main() {
 	}
 	nextSend := time.Time{}
 
-	// Non-spoofing path: send payloads via UDP socket
+	// Non-spoofing path: send payloads via an UNCONNECTED UDP socket to avoid ICMP port-unreachable write errors
 	if !spoofSrcIP {
-		addr := &net.UDPAddr{IP: dstIP, Port: dstPort}
-		conn, err := net.DialUDP("udp", nil, addr)
+		// Create an unconnected UDP socket bound to an ephemeral local port
+		laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+		conn, err := net.ListenUDP("udp", laddr)
 		if err != nil {
-			log.Fatalf("dial udp: %v", err)
+			log.Fatalf("listen udp: %v", err)
 		}
 		defer conn.Close()
+
+		raddr := &net.UDPAddr{IP: dstIP, Port: dstPort}
 
 		count := 0
 		for {
@@ -108,7 +111,9 @@ func main() {
 				nextSend = time.Now().Add(interval)
 			}
 
-			if _, err := conn.Write(payload); err != nil {
+			// Write to remote without a connected socket: ICMP errors won't surface as write errors
+			if _, err := conn.WriteToUDP(payload, raddr); err != nil {
+				// Log at debug if desired; this should rarely fail unless the local stack rejects the send
 				log.Printf("send error at %s: %v", ci.Timestamp, err)
 				continue
 			}
@@ -207,16 +212,14 @@ func main() {
 		}
 		count++
 	}
-	log.Printf("Done (spoof). Injected %d UDP packets to %s:%d (dst MAC %s) via %s", count, dstIP.String(), dstPort, dstMAC.String(), ifaceName)
+	log.Printf("Done (spoof). Injected %d UDP packets to %s:%d via %s", count, dstIP.String(), dstPort, ifaceName)
 }
 
 func decodeUDP(data []byte) gopacket.Packet {
-	// Try Ethernet first
 	pkt := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.Default)
 	if pkt.Layer(layers.LayerTypeUDP) != nil {
 		return pkt
 	}
-	// Try raw IPv4
 	pkt = gopacket.NewPacket(data, layers.LayerTypeIPv4, gopacket.Default)
 	if pkt.Layer(layers.LayerTypeUDP) != nil {
 		return pkt
@@ -274,7 +277,6 @@ func arpResolve(handle *pcap.Handle, iface *net.Interface, srcIP, targetIP net.I
 			return nil, fmt.Errorf("send arp: %w", err)
 		}
 
-		// Wait for reply
 		deadline := time.After(timeout)
 		for {
 			select {
@@ -292,7 +294,6 @@ func arpResolve(handle *pcap.Handle, iface *net.Interface, srcIP, targetIP net.I
 				if reply.Operation != layers.ARPReply {
 					continue
 				}
-				// Expect reply from targetIP to our MAC
 				if net.IP(reply.SourceProtAddress).Equal(targetIP.To4()) {
 					return net.HardwareAddr(reply.SourceHwAddress), nil
 				}
