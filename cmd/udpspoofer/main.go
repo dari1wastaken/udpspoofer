@@ -45,6 +45,10 @@ func main() {
 			Usage: "Addresses to spoof",
 		},
 		cli.StringFlag{
+			Name:  "host",
+			Usage: "Single Address to spoof",
+		},
+		cli.StringFlag{
 			Name:  "protocols",
 			Usage: "List of comma-separated protocols to send replies for. Supported: [tcp, udp]",
 		},
@@ -73,16 +77,13 @@ func main() {
 		logger = log.Logger
 
 		interfaceName := c.String("interface")
-		serverAddrStr := c.String("subnet")
-		synspoofing := false
-		udpspoofing := false
-
-		if serverAddrStr == "" {
-			logger.Fatal().Msg("Please provide a subnet to spoof...")
-		}
-
+		subnetAddrStr := c.String("subnet")
+		hostAddrStr := c.String("host")
 		protoStr := c.String("protocols")
 		protocols := strings.Split(protoStr, ",")
+
+		synspoofing := false
+		udpspoofing := false
 
 		connection, err := Connect()
 		if err != nil {
@@ -96,7 +97,16 @@ func main() {
 		// Init protocol channels and update packet filter
 		var tcpQueue chan TcpPacket
 		var udpQueue chan UdpPacket
-		var filter string = "inbound and net " + serverAddrStr
+
+		netFilter := ""
+		if subnetAddrStr != "" {
+			netFilter = "net " + subnetAddrStr
+		} else if hostAddrStr != "" {
+			netFilter = "host " + hostAddrStr
+		} else {
+			logger.Fatal().Msg("Please provide either a -subnet or -host to spoof...")
+		}
+		var filter string = "inbound and " + netFilter
 
 		for _, proto := range protocols {
 			switch proto {
