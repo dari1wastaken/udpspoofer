@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -45,12 +46,13 @@ func main() {
 			Usage: "Addresses to spoof",
 		},
 		cli.StringFlag{
-			Name:  "host",
-			Usage: "Single Address to spoof",
-		},
-		cli.StringFlag{
 			Name:  "protocols",
 			Usage: "List of comma-separated protocols to send replies for. Supported: [tcp, udp]",
+		},
+		cli.StringFlag{
+			Name:  "udp-bind-ports",
+			Usage: "Comma-separated UDP destination ports to bind locally to suppress ICMP port-unreachable (e.g., 9988,9999).",
+			Value: "",
 		},
 	}
 
@@ -77,13 +79,16 @@ func main() {
 		logger = log.Logger
 
 		interfaceName := c.String("interface")
-		subnetAddrStr := c.String("subnet")
-		hostAddrStr := c.String("host")
-		protoStr := c.String("protocols")
-		protocols := strings.Split(protoStr, ",")
-
+		serverAddrStr := c.String("subnet")
 		synspoofing := false
 		udpspoofing := false
+
+		if serverAddrStr == "" {
+			logger.Fatal().Msg("Please provide a subnet to spoof...")
+		}
+
+		protoStr := c.String("protocols")
+		protocols := strings.Split(protoStr, ",")
 
 		connection, err := Connect()
 		if err != nil {
@@ -94,19 +99,22 @@ func main() {
 		// Load configurable channel size
 		channelSize := GetEnvInt("CHANNEL_SIZE", 10000)
 
+		// Optionally bind UDP ports to suppress ICMP port-unreachable from kernel
+		if ports := parsePortsCSV(c.String("udp-bind-ports")); len(ports) > 0 {
+			startUDPBinders(ports)
+		}
+
 		// Init protocol channels and update packet filter
 		var tcpQueue chan TcpPacket
 		var udpQueue chan UdpPacket
 
-		netFilter := ""
-		if subnetAddrStr != "" {
-			netFilter = "net " + subnetAddrStr
-		} else if hostAddrStr != "" {
-			netFilter = "host " + hostAddrStr
+		// Build a robust BPF filter depending on host vs CIDR
+		var filter string
+		if strings.Contains(serverAddrStr, "/") {
+			filter = "inbound and net " + serverAddrStr
 		} else {
-			logger.Fatal().Msg("Please provide either a -subnet or -host to spoof...")
+			filter = "inbound and host " + serverAddrStr
 		}
-		var filter string = "inbound and " + netFilter
 
 		for _, proto := range protocols {
 			switch proto {
@@ -116,7 +124,6 @@ func main() {
 				filter += " and (tcp[tcpflags] & tcp-fin) == 0 and (tcp[tcpflags] & tcp-rst) == 0"
 				go SaveTCPPackets(connection, tcpQueue)
 			case "udp":
-				// filter should already work
 				udpspoofing = true
 				udpQueue = make(chan UdpPacket, channelSize)
 				go SaveUDPPackets(connection, udpQueue)
@@ -138,8 +145,7 @@ func main() {
 		go sendthread(interfaceName, packetQueue)
 
 		logger.Info().Str("filter", filter).Msg("set bpf filter")
-		err = handle.SetBPFFilter(filter)
-		if err != nil {
+		if err := handle.SetBPFFilter(filter); err != nil {
 			logger.Fatal().Err(err)
 		}
 
@@ -164,7 +170,6 @@ func main() {
 							SendSYNACK(packet, packetQueue)
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-						logger.Debug().Str("proto", "udp").Msg("IN new packet")
 						if udpspoofing {
 							SendUDPReply(packet, packetQueue, udpLimiter)
 						}
@@ -179,9 +184,54 @@ func main() {
 		}
 	}
 
-	err := app.Run(os.Args)
-	if err != nil {
+	if err := app.Run(os.Args); err != nil {
 		logger.Fatal().Err(err)
+	}
+}
+
+// Parse comma-separated ports into ints
+func parsePortsCSV(csv string) []int {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	res := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		i, err := strconv.Atoi(p)
+		if err != nil || i < 1 || i > 65535 {
+			logger.Warn().Str("port", p).Msg("invalid UDP port in udp-bind-ports, skipping")
+			continue
+		}
+		res = append(res, i)
+	}
+	return res
+}
+
+// Bind UDP ports and discard payloads to suppress ICMP Port Unreachable
+func startUDPBinders(ports []int) {
+	for _, port := range ports {
+		go func(prt int) {
+			addr := &net.UDPAddr{IP: net.IPv4zero, Port: prt}
+			conn, err := net.ListenUDP("udp", addr)
+			if err != nil {
+				logger.Error().Int("port", prt).Err(err).Msg("failed to bind UDP port")
+				return
+			}
+			logger.Info().Int("port", prt).Msg("bound UDP port to suppress ICMP")
+			buf := make([]byte, 65535)
+			for {
+				_, _, err := conn.ReadFrom(buf)
+				if err != nil {
+					logger.Warn().Int("port", prt).Err(err).Msg("UDP blackhole read error")
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+		}(port)
 	}
 }
 
@@ -190,6 +240,11 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 	timestamp := packet.Metadata().Timestamp.Unix() * 1000
 	// Get IP layer
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+
+	staticDropLog := struct {
+		last  time.Time
+		count int
+	}{}
 
 	if ipLayer != nil {
 		ip, _ := ipLayer.(*layers.IPv4)
@@ -208,17 +263,11 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 		ippacket.Protocol = uint8(ip.Protocol)
 		ippacket.Checksum = ip.Checksum
 
-		// Let's see the type of the packet
-
 		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 			tcp, _ := tcpLayer.(*layers.TCP)
 
 			var tcppacket TcpPacket
-
-			// Save IP header to packet
 			tcppacket.IpPacket = ippacket
-
-			// Save TCP header to Packet
 			tcppacket.SrcPort = uint16(tcp.SrcPort)
 			tcppacket.DstPort = uint16(tcp.DstPort)
 			tcppacket.Seq = tcp.Seq
@@ -237,27 +286,41 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 			tcppacket.Checksum = tcp.Checksum
 			tcppacket.Urgent = tcp.Urgent
 			tcppacket.Options = SerializeTCPOptions(tcp.Options)
-
 			tcppacket.Payload = b64.StdEncoding.EncodeToString(tcp.Payload)
 
-			tcpQueue <- tcppacket
+			select {
+			case tcpQueue <- tcppacket:
+			default:
+				staticDropLog.count++
+				now := time.Now()
+				if now.Sub(staticDropLog.last) > time.Second {
+					logger.Warn().Int("dropped", staticDropLog.count).Msg("tcp queue full, dropping packets to avoid capture stall")
+					staticDropLog.count = 0
+					staticDropLog.last = now
+				}
+			}
 
 		} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 			udp, _ := udpLayer.(*layers.UDP)
 
 			var udppacket UdpPacket
-
-			// Save IP header to packet
 			udppacket.IpPacket = ippacket
-
-			// Save TCP header to Packet
 			udppacket.SrcPort = uint16(udp.SrcPort)
 			udppacket.DstPort = uint16(udp.DstPort)
 			udppacket.Checksum = udp.Checksum
-
 			udppacket.Payload = b64.StdEncoding.EncodeToString(udp.Payload)
 
-			udpQueue <- udppacket
+			select {
+			case udpQueue <- udppacket:
+			default:
+				staticDropLog.count++
+				now := time.Now()
+				if now.Sub(staticDropLog.last) > time.Second {
+					logger.Warn().Int("dropped", staticDropLog.count).Msg("udp queue full, dropping packets to avoid capture stall")
+					staticDropLog.count = 0
+					staticDropLog.last = now
+				}
+			}
 		}
 	}
 }
@@ -618,148 +681,156 @@ func prepareBatch(conn driver.Conn, table string) (driver.Batch, error) {
 	return conn.PrepareBatch(ctx, header, driver.WithReleaseConnection())
 }
 
+// Double-buffered UDP batcher with async Send to avoid pausing queue consumption
 func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
-	udpbatch, err := prepareBatch(conn, "udppackets")
+	current, err := prepareBatch(conn, "udppackets")
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Error preparing UDP batch")
 	}
-
 	logger.Info().Msg("UDP batch created...")
 
-	udppackets := 0
-	save := false
-
-	// Load configurable batch size (default 50000)
 	batchSize := GetEnvInt("INSERT_BATCH_SIZE", 50000)
+	inBatch := 0
+	var wg sync.WaitGroup
+
+	rotate := func() {
+		if inBatch == 0 {
+			return
+		}
+		toSend := current
+		wg.Add(1)
+		go func(count int) {
+			defer wg.Done()
+			logger.Info().Str("proto", "udp").Int("batch_size", count).Msg("saving batch to clickhouse")
+			if err := toSend.Send(); err != nil {
+				logger.Error().Err(err).Msg("udp batch send error")
+			}
+		}(inBatch)
+
+		var err2 error
+		current, err2 = prepareBatch(conn, "udppackets")
+		if err2 != nil {
+			logger.Error().Err(err2).Msg("udp prepare new batch error")
+		} else {
+			logger.Debug().Msg("prepare new UDP batch after send")
+		}
+		inBatch = 0
+	}
 
 	for {
-		if udppackets >= batchSize || save {
-			logger.Info().Str("proto", "udp").Int("batch_size", udppackets).Msg("saving batch to clickhouse")
-			err = udpbatch.Send()
-			if err != nil {
-				logger.Error().Err(err).Msg("error sending udp batch")
+		pkt := <-udpQueue
+		if pkt.Flush || inBatch >= batchSize {
+			rotate()
+			if pkt.Flush {
+				continue
 			}
-			logger.Debug().Str("proto", "udp").Msg("prepare new batch after send")
-			udpbatch, err = prepareBatch(conn, "udppackets")
-			if err != nil {
-				logger.Error().Err(err).Msg("error preparing udp batch")
-			}
-			udppackets = 0
-			save = false
 		}
 
-		// Blocking call to recieve from the queue
-		packet := <-udpQueue
-		if packet.Flush {
-			save = true
-			continue
-		}
-		err = udpbatch.Append(
-			packet.Timestamp,
-			// IP Header
-			packet.SrcIP,
-			packet.DstIP,
-			packet.IHL,
-			packet.TOS,
-			packet.Length,
-			packet.IpId,
-			packet.Flags,
-			packet.FragOffset,
-			packet.TTL,
-			packet.Protocol,
-			// REMOVED Checksum due to compression
-			// packet.Checksum,
-
-			//Start of the UDP header
-			packet.SrcPort,
-			packet.DstPort,
-			packet.UDPLength,
-			// packet.UDPChecksum,
-
-			packet.Payload,
+		err = current.Append(
+			pkt.Timestamp,
+			pkt.SrcIP,
+			pkt.DstIP,
+			pkt.IHL,
+			pkt.TOS,
+			pkt.Length,
+			pkt.IpId,
+			pkt.Flags,
+			pkt.FragOffset,
+			pkt.TTL,
+			pkt.Protocol,
+			pkt.SrcPort,
+			pkt.DstPort,
+			pkt.UDPLength,
+			pkt.Payload,
 		)
 		if err != nil {
-			logger.Error().Err(err).Msg("error in batching udp packet")
+			logger.Error().Err(err).Msg("ERROR in batching UDPPacket")
+			continue
 		}
-		udppackets++
+		inBatch++
 	}
 }
 
+// Double-buffered TCP batcher with async Send to avoid pausing queue consumption
 func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
-	tcpbatch, err := prepareBatch(conn, "tcppackets")
+	current, err := prepareBatch(conn, "tcppackets")
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Error preparing TCP batch")
 	}
+	logger.Info().Msg("TCP batch created...")
 
-	fmt.Println("TCP batch created...")
-
-	tcppackets := 0
-	save := false
-
-	// Load configurable batch size (default 50000)
 	batchSize := GetEnvInt("INSERT_BATCH_SIZE", 50000)
+	inBatch := 0
+	var wg sync.WaitGroup
+
+	rotate := func() {
+		if inBatch == 0 {
+			return
+		}
+		toSend := current
+		wg.Add(1)
+		go func(count int) {
+			defer wg.Done()
+			logger.Info().Str("proto", "tcp").Int("batch_size", count).Msg("saving batch to clickhouse")
+			if err := toSend.Send(); err != nil {
+				logger.Error().Err(err).Msg("tcp batch send error")
+			}
+		}(inBatch)
+
+		var err2 error
+		current, err2 = prepareBatch(conn, "tcppackets")
+		if err2 != nil {
+			logger.Error().Err(err2).Msg("tcp prepare new batch error")
+		} else {
+			logger.Debug().Msg("prepare new TCP batch after send")
+		}
+		inBatch = 0
+	}
 
 	for {
-		if tcppackets >= batchSize || save {
-			logger.Info().Str("proto", "tcp").Int("batch_size", tcppackets).Msg("saving batch to clickhouse")
-			err = tcpbatch.Send()
-			if err != nil {
-				fmt.Println(err)
+		pkt := <-tcpQueue
+		if pkt.Flush || inBatch >= batchSize {
+			rotate()
+			if pkt.Flush {
+				continue
 			}
-			tcpbatch, err = prepareBatch(conn, "tcppackets")
-			if err != nil {
-				fmt.Println(err)
-			}
-			tcppackets = 0
-			save = false
 		}
 
-		// Blocking call to recieve from the queue
-		packet := <-tcpQueue
-		if packet.Flush {
-			save = true
-			continue
-		}
-		err = tcpbatch.Append(
-			packet.Timestamp,
-			// IP Header
-			packet.SrcIP,
-			packet.DstIP,
-			packet.IHL,
-			packet.TOS,
-			packet.Length,
-			packet.IpId,
-			packet.Flags,
-			packet.FragOffset,
-			packet.TTL,
-			packet.Protocol,
-			// REMOVED Checksum due to compression
-			// packet.Checksum,
-
-			//Start of the TCP header
-			packet.SrcPort,
-			packet.DstPort,
-			packet.Seq,
-			packet.Ack,
-			packet.DataOffset,
-			packet.FIN,
-			packet.SYN,
-			packet.RST,
-			packet.PSH,
-			packet.ACK,
-			packet.URG,
-			packet.ECE,
-			packet.CWR,
-			packet.NS,
-			packet.Window,
-			// packet.TCPChecksum,
-			packet.Urgent,
-			packet.Options,
-			packet.Payload,
+		err = current.Append(
+			pkt.Timestamp,
+			pkt.SrcIP,
+			pkt.DstIP,
+			pkt.IHL,
+			pkt.TOS,
+			pkt.Length,
+			pkt.IpId,
+			pkt.Flags,
+			pkt.FragOffset,
+			pkt.TTL,
+			pkt.Protocol,
+			pkt.SrcPort,
+			pkt.DstPort,
+			pkt.Seq,
+			pkt.Ack,
+			pkt.DataOffset,
+			pkt.FIN,
+			pkt.SYN,
+			pkt.RST,
+			pkt.PSH,
+			pkt.ACK,
+			pkt.URG,
+			pkt.ECE,
+			pkt.CWR,
+			pkt.NS,
+			pkt.Window,
+			pkt.Urgent,
+			pkt.Options,
+			pkt.Payload,
 		)
 		if err != nil {
-			fmt.Println("ERROR in batching TCPPacket: " + err.Error())
+			logger.Error().Err(err).Msg("ERROR in batching TCPPacket")
+			continue
 		}
-		tcppackets++
+		inBatch++
 	}
 }
