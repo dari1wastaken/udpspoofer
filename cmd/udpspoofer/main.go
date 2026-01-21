@@ -304,8 +304,9 @@ func sendthread(interfaceName string, packetQueue chan []byte) {
 		// Send the packet
 		err = handle.WritePacketData(packet)
 		if err != nil {
-			log.Printf("Error sending packet: %v\n", err)
-			log.Printf("Packet: %x\n", packet)
+			logger.Error().Err(err).
+				Str("packet", string(packet)).
+				Msg("error sending packet")
 		}
 	}
 }
@@ -636,11 +637,12 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
 			logger.Info().Str("proto", "udp").Int("batch_size", udppackets).Msg("saving batch to clickhouse")
 			err = udpbatch.Send()
 			if err != nil {
-				fmt.Println(err)
+				logger.Error().Err(err).Msg("error sending udp batch")
 			}
+			logger.Debug().Str("proto", "udp").Msg("prepare new batch after send")
 			udpbatch, err = prepareBatch(conn, "udppackets")
 			if err != nil {
-				fmt.Println(err)
+				logger.Error().Err(err).Msg("error preparing udp batch")
 			}
 			udppackets = 0
 			save = false
@@ -677,7 +679,7 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
 			packet.Payload,
 		)
 		if err != nil {
-			fmt.Println("ERROR in batching UDPPacket: " + err.Error())
+			logger.Error().Err(err).Msg("error in batching udp packet")
 		}
 		udppackets++
 	}
