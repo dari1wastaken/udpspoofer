@@ -26,7 +26,7 @@ PARTITION BY toYYYYMM(Timestamp)
 PRIMARY KEY (DstPort, toStartOfDay(Timestamp), SrcIP)
 ORDER BY (DstPort, toStartOfDay(Timestamp), SrcIP, DstIP)
 SETTINGS index_granularity = 8192
-COMMENT 'Main Packet table containing UDP packet fields'
+COMMENT 'Main Packet table containing UDP packet fields';
 
 
 CREATE TABLE test.tcppackets
