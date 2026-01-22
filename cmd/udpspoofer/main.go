@@ -426,6 +426,11 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 			}
 
 			packetQueue <- buffer.Bytes()
+
+			logger.Debug().
+				Str("src_ip", ipLayer.SrcIP.String()).Str("dst_ip", ipLayer.DstIP.String()).
+				Uint16("src_port", uint16(tcpLayer.SrcPort)).Uint16("dst_port", uint16(tcpLayer.DstPort)).
+				Msg("SYN-ACK sent")
 		}
 
 		if !tcp.SYN && tcp.ACK {
@@ -474,6 +479,11 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 			}
 
 			packetQueue <- buffer.Bytes()
+
+			logger.Debug().
+				Str("src_ip", ipLayer.SrcIP.String()).Str("dst_ip", ipLayer.DstIP.String()).
+				Uint16("src_port", uint16(tcpLayer.SrcPort)).Uint16("dst_port", uint16(tcpLayer.DstPort)).
+				Msg("ACK sent")
 		}
 	}
 }
@@ -543,13 +553,12 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 		return
 	}
 
+	packetQueue <- buffer.Bytes()
+
 	logger.Debug().
 		Str("src_ip", ipLayer.SrcIP.String()).Str("dst_ip", ipLayer.DstIP.String()).
 		Uint16("src_port", uint16(udpLayer.SrcPort)).Uint16("dst_port", uint16(udpLayer.DstPort)).
-		Msg("REPLY send")
-
-	packetQueue <- buffer.Bytes()
-
+		Msg("UDP sent")
 }
 
 // use godot package to load/read the .env file and
