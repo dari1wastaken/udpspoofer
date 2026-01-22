@@ -1,4 +1,4 @@
-# Build pcap-sender with libpcap for raw frame injection when spoofing is enabled
+# Build pcap-sender with libpcap for raw frame injection (UDP/TCP spoofing and TCP send)
 FROM golang:1.25-alpine AS build
 RUN apk add --no-cache build-base libpcap-dev pkgconfig
 WORKDIR /app

@@ -26,12 +26,12 @@ func main() {
 		srcPortOV  int
 	)
 	flag.StringVar(&pcapPath, "pcap", "", "Path to input pcap file")
-	flag.StringVar(&dstIPStr, "dst-ip", "udpspoofer", "Destination IP or hostname to send UDP packets to")
-	flag.IntVar(&dstPort, "dst-port", 9999, "Destination UDP port")
+	flag.StringVar(&dstIPStr, "dst-ip", "udpspoofer", "Destination IP or hostname to send packets to")
+	flag.IntVar(&dstPort, "dst-port", 9999, "Destination UDP/TCP port")
 	flag.IntVar(&pps, "pps", 1000, "Packets per second throttle (approx)")
 	flag.BoolVar(&spoofSrcIP, "spoof-srcip", false, "Enable source IP spoofing (raw packet injection via libpcap)")
-	flag.StringVar(&ifaceName, "iface", "eth0", "Interface to inject packets when spoofing")
-	flag.IntVar(&srcPortOV, "src-port", 0, "Override UDP source port when spoofing (0 = use from pcap)")
+	flag.StringVar(&ifaceName, "iface", "eth0", "Interface to inject packets when spoofing or sending TCP")
+	flag.IntVar(&srcPortOV, "src-port", 0, "Override UDP/TCP source port when spoofing or injecting (0 = use from pcap)")
 	flag.Parse()
 
 	if pps < 0 {
@@ -75,77 +75,55 @@ func main() {
 	}
 	nextSend := time.Time{}
 
-	// Non-spoofing path: send payloads via an UNCONNECTED UDP socket to avoid ICMP port-unreachable write errors
+	// Prepare resources based on mode
+	// UDP socket for non-spoof UDP sends
+	var udpConn *net.UDPConn
 	if !spoofSrcIP {
-		// Create an unconnected UDP socket bound to an ephemeral local port
 		laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-		conn, err := net.ListenUDP("udp", laddr)
+		udpConn, err = net.ListenUDP("udp", laddr)
 		if err != nil {
 			log.Fatalf("listen udp: %v", err)
 		}
-		defer conn.Close()
+		defer udpConn.Close()
+	}
 
-		raddr := &net.UDPAddr{IP: dstIP, Port: dstPort}
+	// Libpcap injection handle + L2/L3 for TCP and for UDP spoof mode
+	var handle *pcap.Handle
+	var localMAC net.HardwareAddr
+	var localIP net.IP
+	var dstMAC net.HardwareAddr
 
-		count := 0
-		for {
-			data, ci, err := r.ReadPacketData()
-			if err != nil {
-				if err.Error() == "EOF" {
-					break
-				}
-				log.Fatalf("read packet: %v", err)
-			}
-			pkt := decodeUDP(data)
-			if pkt == nil {
-				continue
-			}
-			udp := pkt.Layer(layers.LayerTypeUDP).(*layers.UDP)
-			payload := udp.Payload
-
-			if interval > 0 {
-				now := time.Now()
-				if now.Before(nextSend) {
-					time.Sleep(nextSend.Sub(now))
-				}
-				nextSend = time.Now().Add(interval)
-			}
-
-			// Write to remote without a connected socket: ICMP errors won't surface as write errors
-			if _, err := conn.WriteToUDP(payload, raddr); err != nil {
-				// Log at debug if desired; this should rarely fail unless the local stack rejects the send
-				log.Printf("send error at %s: %v", ci.Timestamp, err)
-				continue
-			}
-			count++
+	needRaw := spoofSrcIP // spoof mode uses raw for both UDP and TCP
+	// even without spoofing, TCP sending uses raw injection
+	if !needRaw {
+		needRaw = true
+	}
+	if needRaw {
+		iface, err := net.InterfaceByName(ifaceName)
+		if err != nil {
+			log.Fatalf("interface %s: %v", ifaceName, err)
 		}
-		log.Printf("Done (non-spoof). Sent %d UDP payloads to %s:%d", count, dstIP.String(), dstPort)
-		return
+		localMAC = iface.HardwareAddr
+		localIP = firstIPv4Addr(iface)
+		if localIP == nil {
+			log.Fatalf("could not determine IPv4 address for %s", ifaceName)
+		}
+		handle, err = pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+		if err != nil {
+			log.Fatalf("pcap open: %v", err)
+		}
+		defer handle.Close()
+		dstMAC, err = arpResolve(handle, iface, localIP, dstIP, 3, 2*time.Second)
+		if err != nil {
+			log.Fatalf("ARP resolve %s on %s: %v", dstIP.String(), ifaceName, err)
+		}
 	}
 
-	// Spoofing path: craft Ethernet/IPv4/UDP with random source IP and inject via libpcap
-	iface, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		log.Fatalf("interface %s: %v", ifaceName, err)
-	}
-	localMAC := iface.HardwareAddr
-	localIP := firstIPv4Addr(iface)
-	if localIP == nil {
-		log.Fatalf("could not determine IPv4 address for %s", ifaceName)
-	}
+	raddrUDP := &net.UDPAddr{IP: dstIP, Port: dstPort}
 
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
-	if err != nil {
-		log.Fatalf("pcap open: %v", err)
-	}
-	defer handle.Close()
+	countUDP := 0
+	countTCP := 0
 
-	dstMAC, err := arpResolve(handle, iface, localIP, dstIP, 3, 2*time.Second)
-	if err != nil {
-		log.Fatalf("ARP resolve %s on %s: %v", dstIP.String(), ifaceName, err)
-	}
-
-	count := 0
 	for {
 		data, ci, err := r.ReadPacketData()
 		if err != nil {
@@ -154,49 +132,18 @@ func main() {
 			}
 			log.Fatalf("read packet: %v", err)
 		}
-		pkt := decodeUDP(data)
-		if pkt == nil {
-			continue
-		}
-		udp := pkt.Layer(layers.LayerTypeUDP).(*layers.UDP)
 
-		srcPort := uint16(udp.SrcPort)
-		if srcPortOV > 0 && srcPortOV < 65536 {
-			srcPort = uint16(srcPortOV)
+		// Ethernet decode first, then fallback to IPv4
+		pkt := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.Default)
+		if pkt.Layer(layers.LayerTypeIPv4) == nil {
+			pkt = gopacket.NewPacket(data, layers.LayerTypeIPv4, gopacket.Default)
+			if pkt.Layer(layers.LayerTypeIPv4) == nil {
+				continue
+			}
 		}
 
-		// Random non-reserved IPv4 source
-		srcIP := randomIPv4()
-
-		eth := &layers.Ethernet{
-			SrcMAC:       localMAC,
-			DstMAC:       dstMAC,
-			EthernetType: layers.EthernetTypeIPv4,
-		}
-		ip4 := &layers.IPv4{
-			Version:  4,
-			IHL:      5,
-			TTL:      64,
-			SrcIP:    srcIP,
-			DstIP:    dstIP,
-			Protocol: layers.IPProtocolUDP,
-			Id:       uint16(rand.Intn(65536)),
-		}
-		udpl := &layers.UDP{
-			SrcPort: layers.UDPPort(srcPort),
-			DstPort: layers.UDPPort(dstPort),
-		}
-		udpl.SetNetworkLayerForChecksum(ip4)
-
-		buf := gopacket.NewSerializeBuffer()
-		opts := gopacket.SerializeOptions{
-			FixLengths:       true,
-			ComputeChecksums: true,
-		}
-		if err := gopacket.SerializeLayers(buf, opts, eth, ip4, udpl, gopacket.Payload(udp.Payload)); err != nil {
-			log.Printf("serialize error at %s: %v", ci.Timestamp, err)
-			continue
-		}
+		udpLay := pkt.Layer(layers.LayerTypeUDP)
+		tcpLay := pkt.Layer(layers.LayerTypeTCP)
 
 		if interval > 0 {
 			now := time.Now()
@@ -206,39 +153,147 @@ func main() {
 			nextSend = time.Now().Add(interval)
 		}
 
-		if err := handle.WritePacketData(buf.Bytes()); err != nil {
-			log.Printf("inject error at %s: %v", ci.Timestamp, err)
+		switch {
+		case udpLay != nil:
+			udp := udpLay.(*layers.UDP)
+			payload := udp.Payload
+			srcPort := uint16(udp.SrcPort)
+			if srcPortOV > 0 && srcPortOV < 65536 {
+				srcPort = uint16(srcPortOV)
+			}
+
+			if !spoofSrcIP {
+				// Non-spoof UDP via socket
+				if _, err := udpConn.WriteToUDP(payload, raddrUDP); err != nil {
+					log.Printf("udp send error at %s: %v", ci.Timestamp, err)
+					continue
+				}
+			} else {
+				// Spoof UDP via raw injection
+				srcIP := randomIPv4()
+				if err := injectUDP(handle, localMAC, dstMAC, srcIP, dstIP, srcPort, uint16(dstPort), payload); err != nil {
+					log.Printf("udp inject error at %s: %v", ci.Timestamp, err)
+					continue
+				}
+			}
+			countUDP++
+
+		case tcpLay != nil:
+			tcp := tcpLay.(*layers.TCP)
+			payload := tcp.Payload
+			srcPort := uint16(tcp.SrcPort)
+			if srcPortOV > 0 && srcPortOV < 65536 {
+				srcPort = uint16(srcPortOV)
+			}
+
+			// Inject TCP frames (always raw), spoof if requested
+			srcIP := localIP
+			if spoofSrcIP {
+				srcIP = randomIPv4()
+			}
+			err := injectTCP(handle, localMAC, dstMAC, srcIP, dstIP, srcPort, uint16(dstPort),
+				tcp.Seq, tcp.Ack,
+				tcp.SYN, tcp.ACK, tcp.RST, tcp.FIN, tcp.PSH, tcp.URG, tcp.ECE, tcp.CWR,
+				tcp.Window, tcp.Urgent, tcp.Options, payload)
+			if err != nil {
+				log.Printf("tcp inject error at %s: %v", ci.Timestamp, err)
+				continue
+			}
+			countTCP++
+
+		default:
+			// Not UDP/TCP
 			continue
 		}
-		count++
 	}
-	log.Printf("Done (spoof). Injected %d UDP packets to %s:%d via %s", count, dstIP.String(), dstPort, ifaceName)
+
+	log.Printf("Done. Sent UDP=%d TCP=%d packets to %s:%d (iface %s)", countUDP, countTCP, dstIP.String(), dstPort, ifaceName)
 }
 
-func decodeUDP(data []byte) gopacket.Packet {
-	pkt := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.Default)
-	if pkt.Layer(layers.LayerTypeUDP) != nil {
-		return pkt
+func injectUDP(handle *pcap.Handle, localMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) error {
+	eth := &layers.Ethernet{
+		SrcMAC:       localMAC,
+		DstMAC:       dstMAC,
+		EthernetType: layers.EthernetTypeIPv4,
 	}
-	pkt = gopacket.NewPacket(data, layers.LayerTypeIPv4, gopacket.Default)
-	if pkt.Layer(layers.LayerTypeUDP) != nil {
-		return pkt
+	ip4 := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		Protocol: layers.IPProtocolUDP,
+		Id:       uint16(rand.Intn(65536)),
 	}
-	return nil
+	udp := &layers.UDP{
+		SrcPort: layers.UDPPort(srcPort),
+		DstPort: layers.UDPPort(dstPort),
+	}
+	udp.SetNetworkLayerForChecksum(ip4)
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, eth, ip4, udp, gopacket.Payload(payload)); err != nil {
+		return err
+	}
+	return handle.WritePacketData(buf.Bytes())
+}
+
+func injectTCP(handle *pcap.Handle, localMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, srcPort, dstPort uint16,
+	seq, ack uint32, syn, ackf, rst, fin, psh, urg, ece, cwr bool, window, urgent uint16, options []layers.TCPOption, payload []byte) error {
+
+	eth := &layers.Ethernet{
+		SrcMAC:       localMAC,
+		DstMAC:       dstMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ip4 := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		Protocol: layers.IPProtocolTCP,
+		Id:       uint16(rand.Intn(65536)),
+	}
+	tcp := &layers.TCP{
+		SrcPort:    layers.TCPPort(srcPort),
+		DstPort:    layers.TCPPort(dstPort),
+		Seq:        seq,
+		Ack:        ack,
+		SYN:        syn,
+		ACK:        ackf,
+		RST:        rst,
+		FIN:        fin,
+		PSH:        psh,
+		URG:        urg,
+		ECE:        ece,
+		CWR:        cwr,
+		Window:     window,
+		Urgent:     urgent,
+		Options:    options,
+		DataOffset: 0, // let FixLengths compute
+	}
+	tcp.SetNetworkLayerForChecksum(ip4)
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, eth, ip4, tcp, gopacket.Payload(payload)); err != nil {
+		return err
+	}
+	return handle.WritePacketData(buf.Bytes())
 }
 
 func firstIPv4Addr(iface *net.Interface) net.IP {
 	addrs, _ := iface.Addrs()
 	for _, a := range addrs {
-		var ip net.IP
 		switch v := a.(type) {
 		case *net.IPNet:
-			ip = v.IP
+			if v.IP.To4() != nil {
+				return v.IP.To4()
+			}
 		case *net.IPAddr:
-			ip = v.IP
-		}
-		if ip != nil && ip.To4() != nil {
-			return ip.To4()
+			if v.IP.To4() != nil {
+				return v.IP.To4()
+			}
 		}
 	}
 	return nil
