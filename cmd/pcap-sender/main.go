@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/gopacket"
@@ -124,6 +126,15 @@ func main() {
 	countUDP := 0
 	countTCP := 0
 
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		log.Println("interrupt received, shutting down...")
+		log.Printf("Done. Sent UDP=%d TCP=%d packets to %s:%d (iface %s)\n", countUDP, countTCP, dstIP.String(), dstPort, ifaceName)
+		os.Exit(0)
+	}()
+
 	for {
 		data, ci, err := r.ReadPacketData()
 		if err != nil {
@@ -207,7 +218,6 @@ func main() {
 		}
 	}
 
-	log.Printf("Done. Sent UDP=%d TCP=%d packets to %s:%d (iface %s)", countUDP, countTCP, dstIP.String(), dstPort, ifaceName)
 }
 
 func injectUDP(handle *pcap.Handle, localMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) error {
