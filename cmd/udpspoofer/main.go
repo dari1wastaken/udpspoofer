@@ -136,7 +136,7 @@ func main() {
 		// Open the network interface for packet capture
 		handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
 		if err != nil {
-			logger.Fatal().Err(err)
+			logger.Fatal().Err(err).Msg("fatal: opening interface")
 		}
 		defer handle.Close()
 
@@ -146,7 +146,7 @@ func main() {
 
 		logger.Info().Str("filter", filter).Msg("set bpf filter")
 		if err := handle.SetBPFFilter(filter); err != nil {
-			logger.Fatal().Err(err)
+			logger.Fatal().Err(err).Msg("fatal: setting bpf filter")
 		}
 
 		logger.Info().Str("interface", interfaceName).Msg("Listening on interface")
@@ -185,7 +185,7 @@ func main() {
 	}
 
 	if err := app.Run(os.Args); err != nil {
-		logger.Fatal().Err(err)
+		logger.Fatal().Err(err).Msg("fatal: running app")
 	}
 }
 
@@ -227,7 +227,7 @@ func startUDPBinders(ports []int) {
 			for {
 				_, _, err := conn.ReadFrom(buf)
 				if err != nil {
-					logger.Warn().Int("port", prt).Err(err).Msg("UDP blackhole read error")
+					logger.Error().Err(err).Int("port", prt).Msg("UDP blackhole read error")
 					time.Sleep(100 * time.Millisecond)
 				}
 			}
@@ -421,7 +421,7 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 				ipLayer,
 				tcpLayer,
 			); err != nil {
-				log.Printf("Error serializing packet: %c\n", err)
+				logger.Error().Err(err).Msg("serialize tcp packet error")
 				return
 			}
 
@@ -474,7 +474,7 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 				ipLayer,
 				tcpLayer,
 			); err != nil {
-				log.Printf("Error serializing packet: %c", err)
+				logger.Error().Err(err).Msg("serialize tcp packet error")
 				return
 			}
 
@@ -549,7 +549,7 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 		ipLayer,
 		udpLayer,
 	); err != nil {
-		log.Printf("Error serializing packet: %c\n", err)
+		logger.Error().Err(err).Msg("serialize udp packet error")
 		return
 	}
 
