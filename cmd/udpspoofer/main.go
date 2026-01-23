@@ -128,8 +128,17 @@ func main() {
 				udpQueue = make(chan UdpPacket, channelSize)
 				go SaveUDPPackets(connection, udpQueue)
 			default:
-				logger.Warn().Msg(c.App.Usage)
-				logger.Fatal().Str("protocol", proto).Msg("protocol not supported")
+				if proto == "" {
+					tcpQueue = make(chan TcpPacket, channelSize)
+					udpQueue = make(chan UdpPacket, channelSize)
+					go SaveTCPPackets(connection, tcpQueue)
+					go SaveUDPPackets(connection, udpQueue)
+
+					logger.Info().Str("protocols", "none").Msg("collecting subnet as tcp/udp passive telescope")
+				} else {
+					logger.Warn().Msg(c.App.Usage)
+					logger.Fatal().Str("protocol", proto).Msg("protocol not supported")
+				}
 			}
 		}
 
@@ -154,8 +163,11 @@ func main() {
 		// Make the thread loop infinitely in case it ever fails
 		for {
 
+			var udpLimiter *UdpRateLimiter
 			// Init rate limiter
-			udpLimiter := NewUdpRateLimiter()
+			if udpspoofing {
+				udpLimiter = NewUdpRateLimiter()
+			}
 
 			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
