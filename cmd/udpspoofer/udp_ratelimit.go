@@ -121,32 +121,40 @@ func (r *UdpRateLimiter) bump(m map[uint32]*rateEntry, key uint32, limit int, no
 }
 
 func (r *UdpRateLimiter) cleanupLoop() {
-	// TODO: we might want a separate interval for cleanups
-	intervalMinutes := GetEnvInt("UDP_RL_BLOCK_TTL_MINUTES", 5)
+
+	intervalMinutes := GetEnvInt("UDP_RL_CLEANUP_INTERVAL_MINUTES", 3)
 	ticker := time.NewTicker(time.Duration(intervalMinutes) * time.Minute)
 	logger.Info().Int("minutes", intervalMinutes).Msg("cleanup loop interval")
+	var ips, nets, eps int64
+
 	for range ticker.C {
 		now := time.Now()
-		logger.Info().Time("time", now).Msg("LOOP new cleanup")
+		ips = 0
+		nets = 0
+		eps = 0
 		r.mu.Lock()
 		for k, v := range r.blockedIP {
 			if now.After(v.until) {
-				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked IP")
 				delete(r.blockedIP, k)
+				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked IP")
+				ips += 1
 			}
 		}
 		for k, v := range r.blocked24 {
 			if now.After(v.until) {
-				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked Net")
 				delete(r.blocked24, k)
+				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked Net")
+				nets += 1
 			}
 		}
 		for k, v := range r.blockedEndpoints {
 			if now.After(v.until) {
-				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked EP")
 				delete(r.blockedEndpoints, k)
+				logger.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked EP")
+				eps += 1
 			}
 		}
+		logger.Info().Time("time", now).Int64("src_ips", ips).Int64("src_24s", nets).Int64("endpoints", eps).Msg("cleanup blocked entries")
 		r.mu.Unlock()
 	}
 }

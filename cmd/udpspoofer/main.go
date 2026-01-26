@@ -126,13 +126,13 @@ func main() {
 			case "udp":
 				udpspoofing = true
 				udpQueue = make(chan UdpPacket, channelSize)
-				go SaveUDPPackets(connection, udpQueue)
+				go SaveUDPPackets(connection, udpQueue, GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000))
 			default:
 				if proto == "" {
 					tcpQueue = make(chan TcpPacket, channelSize)
 					udpQueue = make(chan UdpPacket, channelSize)
 					go SaveTCPPackets(connection, tcpQueue)
-					go SaveUDPPackets(connection, udpQueue)
+					go SaveUDPPackets(connection, udpQueue, GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 500))
 
 					logger.Info().Str("protocols", "none").Msg("collecting subnet as tcp/udp passive telescope")
 				} else {
@@ -703,14 +703,13 @@ func prepareBatch(conn driver.Conn, table string) (driver.Batch, error) {
 }
 
 // Double-buffered UDP batcher with async Send to avoid pausing queue consumption
-func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket)) {
+func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) {
 	current, err := prepareBatch(conn, "udppackets")
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Error preparing UDP batch")
 	}
 	logger.Info().Msg("UDP batch created...")
 
-	batchSize := GetEnvInt("INSERT_BATCH_SIZE", 50000)
 	inBatch := 0
 	var wg sync.WaitGroup
 
@@ -780,7 +779,7 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
 	}
 	logger.Info().Msg("TCP batch created...")
 
-	batchSize := GetEnvInt("INSERT_BATCH_SIZE", 50000)
+	batchSize := GetEnvInt("TCP_INSERT_BATCH_SIZE", 50000)
 	inBatch := 0
 	var wg sync.WaitGroup
 
