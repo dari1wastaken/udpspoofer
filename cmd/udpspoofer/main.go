@@ -177,6 +177,8 @@ func main() {
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
 
+					logger.Trace().
+						Msg("new IPv4 packet read")
 					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 						if synspoofing {
 							SendSYNACK(packet, packetQueue)
