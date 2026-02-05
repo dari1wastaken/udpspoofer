@@ -72,6 +72,7 @@ func (r *UdpRateLimiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 		return false
 	}
 
+	// TODO: consider splitting this map into "popular" and "loser" ports to balance traffic being skewed towards few ports
 	dst := uint32(dstIP[2])<<24 | uint32(dstIP[3])<<16 | uint32(dstPort)
 	if b, ok := r.blockedEndpoints[dst]; ok && now.Before(b.until) {
 		logger.Debug().
@@ -133,6 +134,14 @@ func (r *UdpRateLimiter) cleanupLoop() {
 		nets = 0
 		eps = 0
 		r.mu.Lock()
+
+		logger.Info().
+			Time("time", now).
+			Int("src_ips", len(r.blockedIP)).
+			Int("src_24s", len(r.blocked24)).
+			Int("endpoints", len(r.blockedEndpoints)).
+			Msg("current blocked entries")
+
 		for k, v := range r.blockedIP {
 			if now.After(v.until) {
 				delete(r.blockedIP, k)
@@ -154,7 +163,7 @@ func (r *UdpRateLimiter) cleanupLoop() {
 				eps += 1
 			}
 		}
-		logger.Info().Time("time", now).Int64("src_ips", ips).Int64("src_24s", nets).Int64("endpoints", eps).Msg("cleanup blocked entries")
+		logger.Info().Time("time", now).Int64("src_ips", ips).Int64("src_24s", nets).Int64("endpoints", eps).Msg("cleaned blocked entries")
 		r.mu.Unlock()
 	}
 }
