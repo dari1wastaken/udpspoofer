@@ -111,9 +111,9 @@ func main() {
 		// Build a robust BPF filter depending on host vs CIDR
 		var filter string
 		if strings.Contains(serverAddrStr, "/") {
-			filter = "inbound and net " + serverAddrStr
+			filter = "(inbound and net " + serverAddrStr + ")"
 		} else {
-			filter = "inbound and host " + serverAddrStr
+			filter = "(inbound and host " + serverAddrStr + ")"
 		}
 
 		for _, proto := range protocols {
@@ -121,12 +121,15 @@ func main() {
 			case "tcp":
 				synspoofing = true
 				tcpQueue = make(chan TcpPacket, channelSize)
-				filter += " and (tcp[tcpflags] & tcp-fin) == 0 and (tcp[tcpflags] & tcp-rst) == 0"
+
 				go SaveTCPPackets(connection, tcpQueue)
+				logger.Info().Str("protocols", "tcp").Msg("spoofing tcp replies")
 			case "udp":
 				udpspoofing = true
 				udpQueue = make(chan UdpPacket, channelSize)
+
 				go SaveUDPPackets(connection, udpQueue, GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000))
+				logger.Info().Str("protocols", "udp").Msg("spoofing udp replies")
 			default:
 				if proto == "" {
 					tcpQueue = make(chan TcpPacket, channelSize)
@@ -140,6 +143,14 @@ func main() {
 					logger.Fatal().Str("protocol", proto).Msg("protocol not supported")
 				}
 			}
+		}
+
+		if synspoofing && udpspoofing {
+			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
+		} else if synspoofing {
+			filter += " and (tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0))"
+		} else if udpspoofing {
+			filter += " and udp"
 		}
 
 		// Open the network interface for packet capture
