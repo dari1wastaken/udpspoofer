@@ -49,6 +49,10 @@ func main() {
 			Name:  "protocols",
 			Usage: "List of comma-separated protocols to send replies for. Supported: [tcp, udp]",
 		},
+		cli.BoolFlag{
+			Name:  "udp-reflect",
+			Usage: "Send the same UDP payload back to the source",
+		},
 		cli.StringFlag{
 			Name:  "udp-bind-ports",
 			Usage: "Comma-separated UDP destination ports to bind locally to suppress ICMP port-unreachable (e.g., 9988,9999).",
@@ -171,6 +175,11 @@ func main() {
 
 		logger.Info().Str("interface", interfaceName).Msg("Listening on interface")
 
+		reflectPayloads := c.Bool("udp-reflect")
+		if reflectPayloads {
+			logger.Info().Msg("reflecting udp scanners payloads")
+		}
+
 		// Make the thread loop infinitely in case it ever fails
 		for {
 
@@ -196,7 +205,7 @@ func main() {
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 						if udpspoofing {
-							SendUDPReply(packet, packetQueue, udpLimiter)
+							SendUDPReply(packet, packetQueue, udpLimiter, reflectPayloads)
 						}
 					} else {
 						// Not saving anything else for now
@@ -515,7 +524,7 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 
 // Take the incoming UDP packet, and reply with the values from the packet.
 // Assumes packet is IPv4
-func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLimiter) {
+func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLimiter, reflect bool) {
 
 	udpLay := packet.Layer(layers.LayerTypeUDP)
 	ipLay := packet.Layer(layers.LayerTypeIPv4)
@@ -564,25 +573,45 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 	udpLayer.SetNetworkLayerForChecksum(ipLayer)
 
 	buffer := gopacket.NewSerializeBuffer()
-	if err := gopacket.SerializeLayers(
-		buffer,
-		gopacket.SerializeOptions{
-			FixLengths:       true,
-			ComputeChecksums: true,
-		},
-		ethLayer,
-		ipLayer,
-		udpLayer,
-	); err != nil {
-		logger.Error().Err(err).Msg("serialize udp packet error")
-		return
+
+	if reflect {
+		if err := gopacket.SerializeLayers(
+			buffer,
+			gopacket.SerializeOptions{
+				FixLengths:       true,
+				ComputeChecksums: true,
+			},
+			ethLayer,
+			ipLayer,
+			udpLayer,
+			gopacket.Payload(udp.Payload),
+		); err != nil {
+			logger.Error().Err(err).Msg("serialize udp packet error")
+			return
+		}
+	} else {
+		if err := gopacket.SerializeLayers(
+			buffer,
+			gopacket.SerializeOptions{
+				FixLengths:       true,
+				ComputeChecksums: true,
+			},
+			ethLayer,
+			ipLayer,
+			udpLayer,
+		); err != nil {
+			logger.Error().Err(err).Msg("serialize udp packet error")
+			return
+		}
 	}
 
 	packetQueue <- buffer.Bytes()
 
 	logger.Debug().
-		Str("src_ip", ipLayer.SrcIP.String()).Str("dst_ip", ipLayer.DstIP.String()).
-		Uint16("src_port", uint16(udpLayer.SrcPort)).Uint16("dst_port", uint16(udpLayer.DstPort)).
+		Str("src_ip", ipLayer.SrcIP.String()).
+		Str("dst_ip", ipLayer.DstIP.String()).
+		Uint16("src_port", uint16(udpLayer.SrcPort)).
+		Uint16("dst_port", uint16(udpLayer.DstPort)).
 		Msg("UDP sent")
 }
 
