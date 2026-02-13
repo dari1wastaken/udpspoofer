@@ -95,13 +95,6 @@ func main() {
 		}
 		logger.Info().Msg("Database connection set up!")
 
-		// Load configurable channel size
-		channelSize := GetEnvInt("CHANNEL_SIZE", 10000)
-
-		// Init protocol channels and update packet filter
-		var tcpQueue chan TcpPacket
-		var udpQueue chan UdpPacket
-
 		// Build a robust BPF filter depending on host vs CIDR
 		var filter string
 		if strings.Contains(serverAddrStr, "/") {
@@ -110,27 +103,19 @@ func main() {
 			filter = "(inbound and host " + serverAddrStr + ")"
 		}
 
+		// Parse proto flags into bools
+
 		for _, proto := range protocols {
 			switch proto {
 			case "tcp":
 				synspoofing = true
-				tcpQueue = make(chan TcpPacket, channelSize)
-
-				go SaveTCPPackets(connection, tcpQueue)
 				logger.Info().Str("protocols", "tcp").Msg("spoofing tcp replies")
 			case "udp":
 				udpspoofing = true
-				udpQueue = make(chan UdpPacket, channelSize)
-
-				go SaveUDPPackets(connection, udpQueue, GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000))
 				logger.Info().Str("protocols", "udp").Msg("spoofing udp replies")
 			default:
 				if proto == "" {
-					tcpQueue = make(chan TcpPacket, channelSize)
-					udpQueue = make(chan UdpPacket, channelSize)
-					go SaveTCPPackets(connection, tcpQueue)
-					go SaveUDPPackets(connection, udpQueue, GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 500))
-
+					// darknet, collect both
 					logger.Info().Str("protocols", "none").Msg("collecting subnet as tcp/udp passive telescope")
 				} else {
 					logger.Warn().Msg(c.App.Usage)
@@ -139,13 +124,41 @@ func main() {
 			}
 		}
 
+		// Init protocol channels and update packet filter
+		// Protocol queues have fixed size, while batch insert sizes depend on protocol reactiveness
+
+		var tcpQueue chan TcpPacket
+		var udpQueue chan UdpPacket
+
+		// Load configurable channel size
+		channelSize := GetEnvInt("CHANNEL_SIZE", 100000)
+
+		tcpQueue = make(chan TcpPacket, channelSize)
+		udpQueue = make(chan UdpPacket, channelSize)
+
+		var tcpBatchSize, udpBatchSize int
+
 		if synspoofing && udpspoofing {
-			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
+			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 1000)
+			filter += " and (tcp or udp) and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)"
 		} else if synspoofing {
-			filter += " and (tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0))"
+			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
+			filter += " and (tcp or udp) and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)"
 		} else if udpspoofing {
-			filter += " and udp"
+			tcpBatchSize = GetEnvInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
+			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			filter += " and (tcp or udp)"
+		} else {
+			tcpBatchSize = GetEnvInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
+			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
+			filter += " and (tcp or udp)"
 		}
+
+		// Run both data collection regardless of reactiveness, so that we see spillover across adjacent subnets
+		go SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
+		go SaveUDPPackets(connection, udpQueue, udpBatchSize)
 
 		// Open the network interface for packet capture
 		handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
@@ -774,14 +787,13 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) 
 }
 
 // Double-buffered TCP batcher with async Send to avoid pausing queue consumption
-func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
+func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket), batchSize int) {
 	current, err := prepareBatch(conn, "tcppackets")
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Error preparing TCP batch")
 	}
 	logger.Info().Msg("TCP batch created...")
 
-	batchSize := GetEnvInt("TCP_INSERT_BATCH_SIZE", 50000)
 	inBatch := 0
 	var wg sync.WaitGroup
 
