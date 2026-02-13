@@ -141,11 +141,11 @@ func main() {
 		if synspoofing && udpspoofing {
 			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
 			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 1000)
-			filter += " and (tcp or udp) and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)"
+			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
 		} else if synspoofing {
 			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
 			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
-			filter += " and (tcp or udp) and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)"
+			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
 		} else if udpspoofing {
 			tcpBatchSize = GetEnvInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
 			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000)
@@ -351,6 +351,8 @@ func sendthread(interfaceName string, packetQueue chan []byte) {
 		logger.Fatal().Err(err).Msg("sendthread: error opening interface")
 	}
 	defer handle.Close()
+
+	logger.Info().Str("iface", interfaceName).Msg("sending replies on interface")
 
 	for {
 		packet := <-packetQueue
