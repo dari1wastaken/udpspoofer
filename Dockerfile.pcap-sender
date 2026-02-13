@@ -9,7 +9,7 @@ COPY cmd/pcap-sender ./cmd/pcap-sender
 RUN CGO_ENABLED=1 GOOS=linux go build -o pcap-sender ./cmd/pcap-sender
 
 FROM alpine:3.20
-RUN apk add --no-cache libpcap tcpdump
+RUN apk add --no-cache libpcap tcpdump nmap
 WORKDIR /app
 COPY --from=build /app/pcap-sender /app/pcap-sender
 ENTRYPOINT ["sleep", "infinity"]

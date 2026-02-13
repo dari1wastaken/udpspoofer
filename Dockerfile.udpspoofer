@@ -9,9 +9,15 @@ COPY . .
 RUN CGO_ENABLED=1 go build -o udpspoofer ./cmd/udpspoofer
 
 FROM alpine:3.20
-RUN apk add --no-cache libpcap
+RUN apk add --no-cache libpcap iptables tcpdump
 WORKDIR /app
 COPY --from=build /app/udpspoofer /app/udpspoofer
-RUN apk add tcpdump
+
+# TODO: these iptables rules need to be set at runtime. Ideally add them to an entrypoint
+## Suppress kernel responses on TCP SYNs and UDPs
+# iptables -A OUTPUT -o eth0 -s 172.25.0.3 -p tcp --tcp-flags RST RST -j DROP
+# iptables -A OUTPUT -o eth0 -s 172.25.0.3 -p tcp --tcp-flags FIN FIN -j DROP
+# iptables -A OUTPUT -o eth0 -s 172.25.0.3 -p icmp -j DROP
+
 # .env will be mounted by docker-compose (docker.env -> /app/.env)
 ENTRYPOINT ["sleep", "infinity"]
