@@ -53,11 +53,6 @@ func main() {
 			Name:  "udp-reflect",
 			Usage: "Send the same UDP payload back to the source",
 		},
-		cli.StringFlag{
-			Name:  "udp-bind-ports",
-			Usage: "Comma-separated UDP destination ports to bind locally to suppress ICMP port-unreachable (e.g., 9988,9999).",
-			Value: "",
-		},
 	}
 
 	app.Action = func(c *cli.Context) error {
@@ -102,11 +97,6 @@ func main() {
 
 		// Load configurable channel size
 		channelSize := GetEnvInt("CHANNEL_SIZE", 10000)
-
-		// Optionally bind UDP ports to suppress ICMP port-unreachable from kernel
-		if ports := parsePortsCSV(c.String("udp-bind-ports")); len(ports) > 0 {
-			startUDPBinders(ports)
-		}
 
 		// Init protocol channels and update packet filter
 		var tcpQueue chan TcpPacket
@@ -220,52 +210,6 @@ func main() {
 
 	if err := app.Run(os.Args); err != nil {
 		logger.Fatal().Err(err).Msg("fatal: running app")
-	}
-}
-
-// Parse comma-separated ports into ints
-func parsePortsCSV(csv string) []int {
-	csv = strings.TrimSpace(csv)
-	if csv == "" {
-		return nil
-	}
-	parts := strings.Split(csv, ",")
-	res := make([]int, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		i, err := strconv.Atoi(p)
-		if err != nil || i < 1 || i > 65535 {
-			logger.Warn().Str("port", p).Msg("invalid UDP port in udp-bind-ports, skipping")
-			continue
-		}
-		res = append(res, i)
-	}
-	return res
-}
-
-// Bind UDP ports and discard payloads to suppress ICMP Port Unreachable
-func startUDPBinders(ports []int) {
-	for _, port := range ports {
-		go func(prt int) {
-			addr := &net.UDPAddr{IP: net.IPv4zero, Port: prt}
-			conn, err := net.ListenUDP("udp", addr)
-			if err != nil {
-				logger.Error().Int("port", prt).Err(err).Msg("failed to bind UDP port")
-				return
-			}
-			logger.Info().Int("port", prt).Msg("bound UDP port to suppress ICMP")
-			buf := make([]byte, 65535)
-			for {
-				_, _, err := conn.ReadFrom(buf)
-				if err != nil {
-					logger.Error().Err(err).Int("port", prt).Msg("UDP blackhole read error")
-					time.Sleep(100 * time.Millisecond)
-				}
-			}
-		}(port)
 	}
 }
 
@@ -769,10 +713,12 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) 
 			}
 		}(inBatch)
 
-		var err2 error
-		current, err2 = prepareBatch(conn, "udppackets")
-		if err2 != nil {
-			logger.Error().Err(err2).Msg("udp prepare new batch error")
+		// Prepare a new batch; if it fails, leave current as nil so the main loop
+		// can retry preparation before appending. This prevents nil deref panics.
+		current, err = prepareBatch(conn, "udppackets")
+		if err != nil {
+			logger.Error().Err(err).Msg("udp prepare new batch error")
+			current = nil
 		} else {
 			logger.Debug().Msg("prepare new UDP batch after send")
 		}
@@ -784,8 +730,22 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) 
 		if pkt.Flush || inBatch >= batchSize {
 			rotate()
 			if pkt.Flush {
+				// Wait for all in-flight batch sends to complete on explicit flush
+				wg.Wait()
 				continue
 			}
+		}
+
+		// If the current batch is nil (e.g., preparation failed during rotate),
+		// attempt to re-prepare before appending. If it still fails, skip this packet
+		// and try again on the next one rather than panic.
+		if current == nil {
+			current, err = prepareBatch(conn, "udppackets")
+			if err != nil {
+				logger.Error().Err(err).Msg("udp re-prepare batch error; will retry on next packet")
+				continue
+			}
+			logger.Debug().Msg("prepared new UDP batch after previous error")
 		}
 
 		err = current.Append(
@@ -843,6 +803,7 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
 		current, err2 = prepareBatch(conn, "tcppackets")
 		if err2 != nil {
 			logger.Error().Err(err2).Msg("tcp prepare new batch error")
+			current = nil
 		} else {
 			logger.Debug().Msg("prepare new TCP batch after send")
 		}
@@ -854,8 +815,18 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket)) {
 		if pkt.Flush || inBatch >= batchSize {
 			rotate()
 			if pkt.Flush {
+				wg.Wait()
 				continue
 			}
+		}
+
+		if current == nil {
+			current, err = prepareBatch(conn, "tcppackets")
+			if err != nil {
+				logger.Error().Err(err).Msg("tcp re-prepare batch error; will retry on next packet")
+				continue
+			}
+			logger.Debug().Msg("prepared new TCP batch after previous error")
 		}
 
 		err = current.Append(
