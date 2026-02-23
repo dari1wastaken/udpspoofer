@@ -11,7 +11,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -104,7 +103,6 @@ func main() {
 		}
 
 		// Parse proto flags into bools
-
 		for _, proto := range protocols {
 			switch proto {
 			case "tcp":
@@ -125,8 +123,6 @@ func main() {
 		}
 
 		// Init protocol channels and update packet filter
-		// Protocol queues have fixed size, while batch insert sizes depend on protocol reactiveness
-
 		var tcpQueue chan TcpPacket
 		var udpQueue chan UdpPacket
 
@@ -156,7 +152,7 @@ func main() {
 			filter += " and (tcp or udp)"
 		}
 
-		// Run both data collection regardless of reactiveness, so that we see spillover across adjacent subnets
+		// IMPORTANT: ClickHouse batching should be single-writer per table to avoid pool starvation.
 		go SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
 		go SaveUDPPackets(connection, udpQueue, udpBatchSize)
 
@@ -703,7 +699,7 @@ func prepareBatch(conn driver.Conn, table string) (driver.Batch, error) {
 	return conn.PrepareBatch(ctx, header, driver.WithReleaseConnection())
 }
 
-// Double-buffered UDP batcher with async Send to avoid pausing queue consumption
+// Single-writer UDP batcher: no concurrent Send/PrepareBatch to avoid ClickHouse pool starvation.
 func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) {
 	current, err := prepareBatch(conn, "udppackets")
 	if err != nil {
@@ -712,24 +708,17 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) 
 	logger.Info().Msg("UDP batch created...")
 
 	inBatch := 0
-	var wg sync.WaitGroup
 
-	rotate := func() {
+	flush := func() {
 		if inBatch == 0 {
 			return
 		}
-		toSend := current
-		wg.Add(1)
-		go func(count int) {
-			defer wg.Done()
-			logger.Info().Str("proto", "udp").Int("batch_size", count).Msg("saving batch to clickhouse")
-			if err := toSend.Send(); err != nil {
-				logger.Error().Err(err).Msg("udp batch send error")
-			}
-		}(inBatch)
+		logger.Info().Str("proto", "udp").Int("batch_size", inBatch).Msg("saving batch to clickhouse")
+		if err := current.Send(); err != nil {
+			logger.Error().Err(err).Msg("udp batch send error")
+			// Drop the batch and try to recreate on next packet.
+		}
 
-		// Prepare a new batch; if it fails, leave current as nil so the main loop
-		// can retry preparation before appending. This prevents nil deref panics.
 		current, err = prepareBatch(conn, "udppackets")
 		if err != nil {
 			logger.Error().Err(err).Msg("udp prepare new batch error")
@@ -743,17 +732,12 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) 
 	for {
 		pkt := <-udpQueue
 		if pkt.Flush || inBatch >= batchSize {
-			rotate()
+			flush()
 			if pkt.Flush {
-				// Wait for all in-flight batch sends to complete on explicit flush
-				wg.Wait()
 				continue
 			}
 		}
 
-		// If the current batch is nil (e.g., preparation failed during rotate),
-		// attempt to re-prepare before appending. If it still fails, skip this packet
-		// and try again on the next one rather than panic.
 		if current == nil {
 			current, err = prepareBatch(conn, "udppackets")
 			if err != nil {
@@ -788,7 +772,7 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) 
 	}
 }
 
-// Double-buffered TCP batcher with async Send to avoid pausing queue consumption
+// Single-writer TCP batcher: no concurrent Send/PrepareBatch to avoid ClickHouse pool starvation.
 func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket), batchSize int) {
 	current, err := prepareBatch(conn, "tcppackets")
 	if err != nil {
@@ -797,26 +781,19 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket), batchSize int) 
 	logger.Info().Msg("TCP batch created...")
 
 	inBatch := 0
-	var wg sync.WaitGroup
 
-	rotate := func() {
+	flush := func() {
 		if inBatch == 0 {
 			return
 		}
-		toSend := current
-		wg.Add(1)
-		go func(count int) {
-			defer wg.Done()
-			logger.Info().Str("proto", "tcp").Int("batch_size", count).Msg("saving batch to clickhouse")
-			if err := toSend.Send(); err != nil {
-				logger.Error().Err(err).Msg("tcp batch send error")
-			}
-		}(inBatch)
+		logger.Info().Str("proto", "tcp").Int("batch_size", inBatch).Msg("saving batch to clickhouse")
+		if err := current.Send(); err != nil {
+			logger.Error().Err(err).Msg("tcp batch send error")
+		}
 
-		var err2 error
-		current, err2 = prepareBatch(conn, "tcppackets")
-		if err2 != nil {
-			logger.Error().Err(err2).Msg("tcp prepare new batch error")
+		current, err = prepareBatch(conn, "tcppackets")
+		if err != nil {
+			logger.Error().Err(err).Msg("tcp prepare new batch error")
 			current = nil
 		} else {
 			logger.Debug().Msg("prepare new TCP batch after send")
@@ -827,9 +804,8 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket), batchSize int) 
 	for {
 		pkt := <-tcpQueue
 		if pkt.Flush || inBatch >= batchSize {
-			rotate()
+			flush()
 			if pkt.Flush {
-				wg.Wait()
 				continue
 			}
 		}
