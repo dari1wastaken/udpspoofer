@@ -1,4 +1,4 @@
-docker build --rm -t udpspoofer_database:latest .
+docker build --rm --no-cache -t udpspoofer_database:latest .
 docker image prune -f
 echo "----- START RUNNING CONTAINER -----"
 docker run -it --name udpspoofer_database udpspoofer_database
