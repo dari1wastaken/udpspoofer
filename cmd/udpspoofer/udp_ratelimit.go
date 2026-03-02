@@ -137,6 +137,13 @@ func (r *UdpRateLimiter) cleanupLoop() {
 
 		logger.Info().
 			Time("time", now).
+			Int("src_ips", len(r.ipRates)).
+			Int("src_24s", len(r.subRates)).
+			Int("endpoints", len(r.epRates)).
+			Msg("current tracked entries")
+
+		logger.Info().
+			Time("time", now).
 			Int("src_ips", len(r.blockedIP)).
 			Int("src_24s", len(r.blocked24)).
 			Int("endpoints", len(r.blockedEndpoints)).
