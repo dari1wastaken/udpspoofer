@@ -8,8 +8,10 @@ COPY cmd/pcap-sender ./cmd/pcap-sender
 # CGO is required by gopacket/pcap
 RUN CGO_ENABLED=1 GOOS=linux go build -o pcap-sender ./cmd/pcap-sender
 
-FROM alpine:3.20
-RUN apk add --no-cache libpcap tcpdump nmap
+FROM debian:bullseye
+RUN apt update && apt install --yes libpcap-dev tcpdump nmap python3 python3-venv
 WORKDIR /app
 COPY --from=build /app/pcap-sender /app/pcap-sender
+COPY stress-endpoints.py .
+RUN python3 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip scapy
 ENTRYPOINT ["sleep", "infinity"]

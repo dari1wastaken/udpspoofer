@@ -55,7 +55,8 @@ services:
     # Non-spoof:
     # command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "udpspoofer", "--dst-port", "9999", "--pps", "1000"]
     # Spoofing (random src IP) on docker bridge:
-    command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "udpspoofer", "--dst-port", "9999", "--pps", "1000", "--spoof-srcip", "--iface", "eth0"]
+    # command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "udpspoofer", "--dst-port", "9999", "--pps", "1000", "--spoof-srcip", "--iface", "eth0"]
+    # command: [""]
     networks:
       telescope-net:
 
