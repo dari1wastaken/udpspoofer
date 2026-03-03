@@ -128,6 +128,7 @@ func main() {
 
 		// Load configurable channel size
 		channelSize := GetEnvInt("CHANNEL_SIZE", 100000)
+		logger.Info().Int("size", channelSize).Msg("CHANNEL_SIZE")
 
 		tcpQueue = make(chan TcpPacket, channelSize)
 		udpQueue = make(chan UdpPacket, channelSize)
@@ -151,6 +152,9 @@ func main() {
 			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
 			filter += " and (tcp or udp)"
 		}
+
+		logger.Info().Int("size", tcpBatchSize).Msg("TCP batch size")
+		logger.Info().Int("size", udpBatchSize).Msg("UDP batch size")
 
 		// IMPORTANT: ClickHouse batching should be single-writer per table to avoid pool starvation.
 		go SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
@@ -196,18 +200,22 @@ func main() {
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
 
-					logger.Trace().
-						Msg("new IPv4 packet read")
 					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+						logger.Trace().
+							Msg("new TCP/IPv4 packet read")
 						if synspoofing {
 							SendSYNACK(packet, packetQueue)
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+						logger.Trace().
+							Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
 							SendUDPReply(packet, packetQueue, udpLimiter, reflectPayloads)
 						}
 					} else {
 						// Not saving anything else for now
+						logger.Trace().
+							Msg("new OtherProto/IPv4 packet read")
 						continue
 					}
 
