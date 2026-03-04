@@ -58,27 +58,20 @@ func (r *UdpRateLimiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 	// Block check
 	src := Ip2int(srcIP)
 	if b, ok := r.blockedIP[src]; ok && now.Before(b.until) {
-		logger.Debug().
-			Str("src_ip", srcIP.String()).
-			Msg("REASON srcIP blocked")
+		logger.Debug().Str("src_ip", srcIP.String()).Msg("REASON srcIP blocked")
 		return false
 	}
 
 	subnet := src & 0xFFFFFF00
 	if b, ok := r.blocked24[subnet]; ok && now.Before(b.until) {
-		logger.Debug().
-			Str("subnet", srcIP.String()).
-			Msg("REASON subnet blocked")
+		logger.Debug().Str("subnet", srcIP.String()).Msg("REASON subnet blocked")
 		return false
 	}
 
 	// TODO: consider splitting this map into "popular" and "loser" ports to balance traffic being skewed towards few ports
 	dst := uint32(dstIP[2])<<24 | uint32(dstIP[3])<<16 | uint32(dstPort)
 	if b, ok := r.blockedEndpoints[dst]; ok && now.Before(b.until) {
-		logger.Debug().
-			Str("dst_ip", dstIP.String()).
-			Uint16("dst_port", dstPort).
-			Msg("REASON endpoint blocked")
+		logger.Debug().Str("dst_ip", dstIP.String()).Uint16("dst_port", dstPort).Msg("REASON endpoint blocked")
 		return false
 	}
 

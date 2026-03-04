@@ -201,27 +201,25 @@ func main() {
 				if ipLayer != nil {
 
 					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-						logger.Trace().
-							Msg("new TCP/IPv4 packet read")
+						logger.Trace().Msg("new TCP/IPv4 packet read")
 						if synspoofing {
 							SendSYNACK(packet, packetQueue)
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-						logger.Trace().
-							Msg("new UDP/IPv4 packet read")
+						logger.Trace().Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
 							SendUDPReply(packet, packetQueue, udpLimiter, reflectPayloads)
 						}
 					} else {
 						// Not saving anything else for now
-						logger.Trace().
-							Msg("new OtherProto/IPv4 packet read")
+						logger.Trace().Msg("new OtherProto/IPv4 packet read")
 						continue
 					}
 
 					savePackets(packet, tcpQueue, udpQueue)
 				}
 			}
+			logger.Warn().Msg("out of packetSource loop, starting again")
 		}
 	}
 
