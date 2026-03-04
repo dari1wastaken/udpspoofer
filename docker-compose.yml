@@ -31,8 +31,6 @@ services:
       - seccomp:unconfined
     volumes:
       - ./docker.env:/app/.env:ro
-    # Example:
-    # command: ["./udpspoofer", "--interface", "eth0", "--subnet", "172.25.0.0/16", "--protocols", "udp"]
     networks:
       telescope-net:
         aliases:
@@ -52,11 +50,6 @@ services:
       - seccomp:unconfined
     volumes:
       - ./testdata/input.pcap:/pcap/input.pcap:ro
-    # Non-spoof:
-    # command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "udpspoofer", "--dst-port", "9999", "--pps", "1000"]
-    # Spoofing (random src IP) on docker bridge:
-    # command: ["./pcap-sender", "--pcap", "/pcap/input.pcap", "--dst-ip", "udpspoofer", "--dst-port", "9999", "--pps", "1000", "--spoof-srcip", "--iface", "eth0"]
-    # command: [""]
     networks:
       telescope-net:
 
