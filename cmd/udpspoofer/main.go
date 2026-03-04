@@ -7,9 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"net"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,11 +16,14 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/joho/godotenv"
 	"github.com/urfave/cli"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"udpspoofer/internal/config"
+	"udpspoofer/internal/netutil"
+	udprl "udpspoofer/internal/ratelimit/udp"
 )
 
 var logger zerolog.Logger
@@ -55,10 +56,16 @@ func main() {
 	}
 
 	app.Action = func(c *cli.Context) error {
-
 		zerolog.TimeFieldFormat = time.RFC3339Nano
+
+		// Load .env exactly once (matching current behavior: fatal if missing).
+		if err := config.LoadDotEnvOnce(".env"); err != nil {
+			// logger isn't configured yet; use standard log.Logger default formatting via zerolog/log package.
+			log.Fatal().Err(err).Msg("Error loading .env file")
+		}
+
 		var level zerolog.Level
-		switch strings.ToLower(GoDotEnvVariable("LOG_LEVEL")) {
+		switch strings.ToLower(config.GetString("LOG_LEVEL", "")) {
 		case "debug":
 			level = zerolog.DebugLevel
 		case "info":
@@ -127,7 +134,7 @@ func main() {
 		var udpQueue chan UdpPacket
 
 		// Load configurable channel size
-		channelSize := GetEnvInt("CHANNEL_SIZE", 100000)
+		channelSize := config.GetInt("CHANNEL_SIZE", 100000)
 		logger.Info().Int("size", channelSize).Msg("CHANNEL_SIZE")
 
 		tcpQueue = make(chan TcpPacket, channelSize)
@@ -136,20 +143,20 @@ func main() {
 		var tcpBatchSize, udpBatchSize int
 
 		if synspoofing && udpspoofing {
-			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
-			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 1000)
+			tcpBatchSize = config.GetInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			udpBatchSize = config.GetInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 1000)
 			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
 		} else if synspoofing {
-			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
-			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
+			tcpBatchSize = config.GetInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			udpBatchSize = config.GetInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
 			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
 		} else if udpspoofing {
-			tcpBatchSize = GetEnvInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
-			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			tcpBatchSize = config.GetInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
+			udpBatchSize = config.GetInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000)
 			filter += " and (tcp or udp)"
 		} else {
-			tcpBatchSize = GetEnvInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
-			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
+			tcpBatchSize = config.GetInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
+			udpBatchSize = config.GetInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
 			filter += " and (tcp or udp)"
 		}
 
@@ -183,23 +190,22 @@ func main() {
 			logger.Info().Msg("reflecting udp scanners payloads")
 		}
 
+		udpCfg := udprl.ConfigFromEnv()
+
 		// Make the thread loop infinitely in case it ever fails
 		for {
-
-			var udpLimiter *UdpRateLimiter
+			var udpLimiter *udprl.Limiter
 			// Init rate limiter
 			if udpspoofing {
-				udpLimiter = NewUdpRateLimiter()
+				udpLimiter = udprl.New(udpCfg, logger)
 			}
 
 			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
-
 				// Only process IPv4
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
-
 					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 						logger.Trace().Msg("new TCP/IPv4 packet read")
 						if synspoofing {
@@ -244,8 +250,8 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 
 		var ippacket IpPacket
 		ippacket.Timestamp = timestamp
-		ippacket.SrcIP = Ip2int(ip.SrcIP)
-		ippacket.DstIP = Ip2int(ip.DstIP)
+		ippacket.SrcIP = netutil.IPv4ToUint32(ip.SrcIP.To4())
+		ippacket.DstIP = netutil.IPv4ToUint32(ip.DstIP.To4())
 		ippacket.IHL = ip.IHL
 		ippacket.TOS = ip.TOS
 		ippacket.Length = ip.Length
@@ -337,13 +343,6 @@ func SerializeTCPOptions(options []layers.TCPOption) string {
 	}
 
 	return string(tcpOptionsJSON)
-}
-
-func Ip2int(ip net.IP) uint32 {
-	if len(ip) == 16 {
-		panic("no sane way to convert ipv6 into uint32")
-	}
-	return binary.BigEndian.Uint32(ip)
 }
 
 func sendthread(interfaceName string, packetQueue chan []byte) {
@@ -485,8 +484,7 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 
 // Take the incoming UDP packet, and reply with the values from the packet.
 // Assumes packet is IPv4
-func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLimiter, reflect bool) {
-
+func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Limiter, reflect bool) {
 	udpLay := packet.Layer(layers.LayerTypeUDP)
 	ipLay := packet.Layer(layers.LayerTypeIPv4)
 	if udpLay == nil || ipLay == nil {
@@ -576,60 +574,30 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 		Msg("UDP sent")
 }
 
-// use godot package to load/read the .env file and
-// return the value of the key
-func GoDotEnvVariable(key string) string {
-
-	// load .env file
-	err := godotenv.Load(".env")
-
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Error loading .env file")
-	}
-
-	return os.Getenv(key)
-}
-
-// Get Env var as int with default fallback
-func GetEnvInt(key string, def int) int {
-	val := GoDotEnvVariable(key)
-	if val == "" {
-		return def
-	}
-	i, err := strconv.Atoi(val)
-	if err != nil {
-		return def
-	}
-	return i
-}
-
 // Function to connect to a Clickhouse database. NOTE: TLS is disabled at this moment. To allow for TLS, we should include this here.
 // It is running internally, so for now w/e
 func Connect() (driver.Conn, error) {
 	var (
 		ctx       = context.Background()
 		conn, err = clickhouse.Open(&clickhouse.Options{
-			Addr: []string{GoDotEnvVariable("DATABASE_HOST") + ":" + GoDotEnvVariable("DATABASE_PORT")},
+			Addr: []string{config.GetString("DATABASE_HOST", "") + ":" + config.GetString("DATABASE_PORT", "")},
 			Auth: clickhouse.Auth{
-				Database: GoDotEnvVariable("DATABASE"),
-				Username: GoDotEnvVariable("DATABASE_USER"),
-				Password: GoDotEnvVariable("DATABASE_PASSWORD"),
+				Database: config.GetString("DATABASE", ""),
+				Username: config.GetString("DATABASE_USER", ""),
+				Password: config.GetString("DATABASE_PASSWORD", ""),
 			},
 			ClientInfo: clickhouse.ClientInfo{
 				Products: []struct {
 					Name    string
 					Version string
 				}{
-					{Name: GoDotEnvVariable("DATABASE_CLIENT_NAME"), Version: GoDotEnvVariable("VERSION")},
+					{Name: config.GetString("DATABASE_CLIENT_NAME", ""), Version: config.GetString("VERSION", "")},
 				},
 			},
 
 			Debugf: func(format string, v ...interface{}) {
 				fmt.Printf(format, v)
 			},
-			// TLS: &tls.Config{
-			// 	InsecureSkipVerify: true,
-			// },
 		})
 	)
 
@@ -863,3 +831,7 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket), batchSize int) 
 		inBatch++
 	}
 }
+
+// NOTE: this file still imports encoding/binary for other code paths, but Ip2int is now unused.
+// If you want, we can remove encoding/binary import and any remaining uses in a follow-up cleanup.
+var _ = binary.BigEndian
