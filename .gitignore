@@ -34,3 +34,4 @@ go.work.sum
 clickhouse_data/
 *.pcap
 .venv
+bin/
