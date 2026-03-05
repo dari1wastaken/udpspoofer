@@ -195,10 +195,10 @@ func main() {
 		// Make the thread loop infinitely in case it ever fails
 		for {
 			var udpLimiter *udprl.Limiter
-			// Init rate limiter
 			if udpspoofing {
 				udpLimiter = udprl.New(udpCfg)
 			}
+			var udpReplyCode int
 
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
@@ -213,7 +213,11 @@ func main() {
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 						l.Trace().Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
-							SendUDPReply(packet, packetQueue, udpLimiter)
+							udpReplyCode = SendUDPReply(packet, packetQueue, udpLimiter)
+							if udpReplyCode == UDP_REPLY_BLOCKED && saveBlockedUDP {
+								savePackets(packet, tcpQueue, udpQueue)
+								continue
+							}
 						}
 					} else {
 						// Not saving anything else for now
@@ -481,13 +485,20 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 	}
 }
 
-// Take the incoming UDP packet, and reply with the values from the packet.
-// Assumes packet is IPv4
-func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Limiter) {
+const (
+	UDP_REPLY_ERROR   int = -1
+	UDP_REPLY_SENT    int = 0
+	UDP_REPLY_BLOCKED int = 1
+)
+
+// Take the incoming UDP packet, and reply with the values from the packet. Assumes packet is IPv4
+// Returns UDP_REPLY_* value
+func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Limiter) int {
+
 	udpLay := packet.Layer(layers.LayerTypeUDP)
 	ipLay := packet.Layer(layers.LayerTypeIPv4)
 	if udpLay == nil || ipLay == nil {
-		return
+		return UDP_REPLY_ERROR
 	}
 
 	ip, _ := ipLay.(*layers.IPv4)
@@ -499,12 +510,12 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Lim
 			Str("src_ip", ip.SrcIP.String()).Str("dst_ip", ip.DstIP.String()).
 			Uint16("src_port", uint16(udp.SrcPort)).Uint16("dst_port", uint16(udp.DstPort)).
 			Msg("PACKET BLOCKED")
-		return
+		return UDP_REPLY_BLOCKED
 	}
 
 	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
 	if ethernetLayer == nil {
-		return
+		return UDP_REPLY_ERROR
 	}
 	ethernet, _ := ethernetLayer.(*layers.Ethernet)
 
@@ -543,7 +554,7 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Lim
 		udpLayer,
 	); err != nil {
 		l.Error().Err(err).Msg("serialize udp packet error")
-		return
+		return UDP_REPLY_ERROR
 	}
 
 	packetQueue <- buffer.Bytes()
@@ -554,4 +565,6 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Lim
 		Uint16("src_port", uint16(udpLayer.SrcPort)).
 		Uint16("dst_port", uint16(udpLayer.DstPort)).
 		Msg("UDP sent")
+
+	return UDP_REPLY_SENT
 }
