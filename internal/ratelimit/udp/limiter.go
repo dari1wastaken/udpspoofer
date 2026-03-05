@@ -135,7 +135,7 @@ func (r *Limiter) bump(m map[uint32]*rateEntry, key uint32, limit int, now time.
 func (r *Limiter) cleanupLoop() {
 	ticker := time.NewTicker(r.cfg.CleanupInterval)
 	r.l.Info().
-		Dur("interval", r.cfg.CleanupInterval).
+		Int("interval", int(r.cfg.CleanupInterval.Minutes())).
 		Int("udp_entry_cleanup_intervals", r.cfg.EntryCleanupIntervals).
 		Msg("cleanup loop interval")
 

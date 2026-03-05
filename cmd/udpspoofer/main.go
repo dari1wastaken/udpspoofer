@@ -365,7 +365,7 @@ func sendthread(interfaceName string, packetQueue chan []byte) {
 	}
 	defer handle.Close()
 
-	l.Info().Str("iface", interfaceName).Msg("sending replies on interface")
+	l.Info().Str("iface", interfaceName).Msg("interface")
 
 	for {
 		packet := <-packetQueue
