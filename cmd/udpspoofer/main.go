@@ -23,6 +23,7 @@ import (
 
 var l zl.Logger
 var packetQueue chan []byte
+var staticDropLogSeconds int
 
 const MaxPacketSize = 65536 // Maximum packet size
 
@@ -65,6 +66,8 @@ func main() {
 
 		log.Setup(config.GetString("LOG_LEVEL", ""))
 		l = log.Logger()
+
+		staticDropLogSeconds = config.GetInt("STATIC_DROP_LOG_SECS", 30)
 
 		// Parse CLI flags
 
@@ -295,7 +298,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQ
 			default:
 				staticDropLog.count++
 				now := time.Now()
-				if now.Sub(staticDropLog.last) > time.Second {
+				if now.Sub(staticDropLog.last) > time.Duration(staticDropLogSeconds)*time.Second {
 					l.Warn().Int("dropped", staticDropLog.count).Msg("tcp queue full, dropping packets to avoid capture stall")
 					staticDropLog.count = 0
 					staticDropLog.last = now
@@ -317,7 +320,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQ
 			default:
 				staticDropLog.count++
 				now := time.Now()
-				if now.Sub(staticDropLog.last) > time.Second {
+				if now.Sub(staticDropLog.last) > time.Duration(staticDropLogSeconds)*time.Second {
 					l.Warn().Int("dropped", staticDropLog.count).Msg("udp queue full, dropping packets to avoid capture stall")
 					staticDropLog.count = 0
 					staticDropLog.last = now
@@ -349,7 +352,7 @@ func serializeTCPOptions(options []layers.TCPOption) string {
 }
 
 func sendthread(interfaceName string, packetQueue chan []byte) {
-	// Open the network interface for packet capture
+
 	handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
 	if err != nil {
 		l.Fatal().Err(err).Msg("sendthread: error opening interface")
@@ -361,7 +364,6 @@ func sendthread(interfaceName string, packetQueue chan []byte) {
 	for {
 		packet := <-packetQueue
 
-		// Send the packet
 		err = handle.WritePacketData(packet)
 		if err != nil {
 			l.Error().Err(err).
