@@ -45,10 +45,6 @@ func main() {
 			Usage: "List of comma-separated protocols to send replies for. Supported: [tcp, udp]",
 		},
 		cli.BoolFlag{
-			Name:  "udp-reflect",
-			Usage: "Send the same UDP payload back to the source",
-		},
-		cli.BoolFlag{
 			Name:  "save-clickhouse-db",
 			Usage: "Save packets to Clickhouse tables",
 		},
@@ -107,11 +103,6 @@ func main() {
 					l.Fatal().Str("protocol", proto).Msg("protocol not supported")
 				}
 			}
-		}
-
-		reflectPayloads := c.Bool("udp-reflect")
-		if reflectPayloads {
-			l.Info().Msg("reflecting udp scanners payloads back at them")
 		}
 
 		saveClickhouseDB := c.Bool("save-clickhouse-db")
@@ -222,7 +213,7 @@ func main() {
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 						l.Trace().Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
-							SendUDPReply(packet, packetQueue, udpLimiter, reflectPayloads)
+							SendUDPReply(packet, packetQueue, udpLimiter)
 						}
 					} else {
 						// Not saving anything else for now
@@ -492,7 +483,7 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 
 // Take the incoming UDP packet, and reply with the values from the packet.
 // Assumes packet is IPv4
-func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Limiter, reflect bool) {
+func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Limiter) {
 	udpLay := packet.Layer(layers.LayerTypeUDP)
 	ipLay := packet.Layer(layers.LayerTypeIPv4)
 	if udpLay == nil || ipLay == nil {
@@ -541,35 +532,18 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Lim
 
 	buffer := gopacket.NewSerializeBuffer()
 
-	if reflect {
-		if err := gopacket.SerializeLayers(
-			buffer,
-			gopacket.SerializeOptions{
-				FixLengths:       true,
-				ComputeChecksums: true,
-			},
-			ethLayer,
-			ipLayer,
-			udpLayer,
-			gopacket.Payload(udp.Payload),
-		); err != nil {
-			l.Error().Err(err).Msg("serialize udp packet error")
-			return
-		}
-	} else {
-		if err := gopacket.SerializeLayers(
-			buffer,
-			gopacket.SerializeOptions{
-				FixLengths:       true,
-				ComputeChecksums: true,
-			},
-			ethLayer,
-			ipLayer,
-			udpLayer,
-		); err != nil {
-			l.Error().Err(err).Msg("serialize udp packet error")
-			return
-		}
+	if err := gopacket.SerializeLayers(
+		buffer,
+		gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		},
+		ethLayer,
+		ipLayer,
+		udpLayer,
+	); err != nil {
+		l.Error().Err(err).Msg("serialize udp packet error")
+		return
 	}
 
 	packetQueue <- buffer.Bytes()
