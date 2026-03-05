@@ -1,32 +1,29 @@
 package main
 
 import (
-	"context"
 	b64 "encoding/base64"
-	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"math/rand"
-	"net"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ClickHouse/clickhouse-go/v2"
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/joho/godotenv"
+	zl "github.com/rs/zerolog"
 	"github.com/urfave/cli"
 
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"udpspoofer/internal/config"
+	"udpspoofer/internal/db"
+	"udpspoofer/internal/log"
+	"udpspoofer/internal/netutil"
+	udprl "udpspoofer/internal/ratelimit/udp"
 )
 
-var logger zerolog.Logger
+var l zl.Logger
 var packetQueue chan []byte
+var staticDropLogSeconds int
 
 const MaxPacketSize = 65536 // Maximum packet size
 
@@ -49,52 +46,83 @@ func main() {
 			Usage: "List of comma-separated protocols to send replies for. Supported: [tcp, udp]",
 		},
 		cli.BoolFlag{
-			Name:  "udp-reflect",
-			Usage: "Send the same UDP payload back to the source",
+			Name:  "save-clickhouse-db",
+			Usage: "Save packets to Clickhouse tables",
+		},
+		cli.BoolFlag{
+			Name:  "save-blocked-udp",
+			Usage: "Save UDP packets that have been blocked by the rate limiter (useless without udp spoofing and save-clickhouse-db)",
 		},
 	}
 
 	app.Action = func(c *cli.Context) error {
 
-		zerolog.TimeFieldFormat = time.RFC3339Nano
-		var level zerolog.Level
-		switch strings.ToLower(GoDotEnvVariable("LOG_LEVEL")) {
-		case "debug":
-			level = zerolog.DebugLevel
-		case "info":
-			level = zerolog.InfoLevel
-		case "warn":
-			level = zerolog.WarnLevel
-		case "error":
-			level = zerolog.ErrorLevel
-		case "trace":
-			level = zerolog.TraceLevel
-		default:
-			level = zerolog.InfoLevel
+		// Setup logger
+
+		if err := config.LoadDotEnvOnce(".env"); err != nil {
+			// logger isn't configured yet
+			panic("Error loading .env file")
 		}
 
-		log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger().Level(level)
-		logger = log.Logger
+		log.Setup(config.GetString("LOG_LEVEL", ""))
+		l = log.Logger()
+
+		staticDropLogSeconds = config.GetInt("STATIC_DROP_LOG_SECS", 30)
+
+		// Parse CLI flags
 
 		interfaceName := c.String("interface")
-		serverAddrStr := c.String("subnet")
-		synspoofing := false
-		udpspoofing := false
-
-		if serverAddrStr == "" {
-			logger.Fatal().Msg("Please provide a subnet to spoof...")
+		if interfaceName == "" {
+			l.Warn().Msg(c.App.Usage)
+			l.Fatal().Msg("Please provide a subnet to spoof...")
 		}
 
+		serverAddrStr := c.String("subnet")
+		if serverAddrStr == "" {
+			l.Fatal().Msg("Please provide a subnet to spoof...")
+		}
+
+		// TODO: these can be two separate bool flags
 		protoStr := c.String("protocols")
 		protocols := strings.Split(protoStr, ",")
 
-		connection, err := Connect()
-		if err != nil {
-			logger.Fatal().Err(err).Msg("Couldnt establish connection to database")
-		}
-		logger.Info().Msg("Database connection set up!")
+		synspoofing := false
+		udpspoofing := false
 
-		// Build a robust BPF filter depending on host vs CIDR
+		for _, proto := range protocols {
+			switch proto {
+			case "tcp":
+				synspoofing = true
+				l.Info().Str("protocols", "tcp").Msg("spoofing tcp replies")
+			case "udp":
+				udpspoofing = true
+				l.Info().Str("protocols", "udp").Msg("spoofing udp replies")
+			default:
+				if proto == "" {
+					// darknet, collect both
+					l.Info().Str("protocols", "none").Msg("collecting subnet as tcp/udp passive telescope")
+				} else {
+					l.Warn().Msg(c.App.Usage)
+					l.Fatal().Str("protocol", proto).Msg("protocol not supported")
+				}
+			}
+		}
+
+		saveClickhouseDB := c.Bool("save-clickhouse-db")
+		if saveClickhouseDB {
+			l.Info().Msg("saving data to clickhouse")
+		}
+
+		saveBlockedUDP := c.Bool("save-blocked-udp")
+		if saveBlockedUDP {
+			l.Info().Msg("saving UDP packets blocked by the rate limiter")
+		}
+
+		// Build BPF filter
+		// - single host vs CIDR
+		// - Incoming TCP RST/FIN dropped when reacting
+		// - Still collecting either transport regardless
+
 		var filter string
 		if strings.Contains(serverAddrStr, "/") {
 			filter = "(inbound and net " + serverAddrStr + ")"
@@ -102,134 +130,124 @@ func main() {
 			filter = "(inbound and host " + serverAddrStr + ")"
 		}
 
-		// Parse proto flags into bools
-		for _, proto := range protocols {
-			switch proto {
-			case "tcp":
-				synspoofing = true
-				logger.Info().Str("protocols", "tcp").Msg("spoofing tcp replies")
-			case "udp":
-				udpspoofing = true
-				logger.Info().Str("protocols", "udp").Msg("spoofing udp replies")
-			default:
-				if proto == "" {
-					// darknet, collect both
-					logger.Info().Str("protocols", "none").Msg("collecting subnet as tcp/udp passive telescope")
-				} else {
-					logger.Warn().Msg(c.App.Usage)
-					logger.Fatal().Str("protocol", proto).Msg("protocol not supported")
-				}
-			}
-		}
+		// Init protocol channel sizes and BPF filter
 
-		// Init protocol channels and update packet filter
-		var tcpQueue chan TcpPacket
-		var udpQueue chan UdpPacket
+		var tcpQueue chan netutil.TcpPacket
+		var udpQueue chan netutil.UdpPacket
 
-		// Load configurable channel size
-		channelSize := GetEnvInt("CHANNEL_SIZE", 100000)
-		logger.Info().Int("size", channelSize).Msg("CHANNEL_SIZE")
+		channelSize := config.GetInt("CHANNEL_SIZE", 100000)
+		l.Info().Int("size", channelSize).Msg("channel size")
 
-		tcpQueue = make(chan TcpPacket, channelSize)
-		udpQueue = make(chan UdpPacket, channelSize)
-
+		// Init batch sizes regardless of using Clickhouse
 		var tcpBatchSize, udpBatchSize int
 
 		if synspoofing && udpspoofing {
-			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
-			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 1000)
+			tcpBatchSize = config.GetInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			udpBatchSize = config.GetInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 1000)
 			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
 		} else if synspoofing {
-			tcpBatchSize = GetEnvInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
-			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
+			tcpBatchSize = config.GetInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			udpBatchSize = config.GetInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
 			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
 		} else if udpspoofing {
-			tcpBatchSize = GetEnvInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
-			udpBatchSize = GetEnvInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000)
+			tcpBatchSize = config.GetInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
+			udpBatchSize = config.GetInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000)
 			filter += " and (tcp or udp)"
 		} else {
-			tcpBatchSize = GetEnvInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
-			udpBatchSize = GetEnvInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
+			tcpBatchSize = config.GetInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
+			udpBatchSize = config.GetInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
 			filter += " and (tcp or udp)"
 		}
 
-		logger.Info().Int("size", tcpBatchSize).Msg("TCP batch size")
-		logger.Info().Int("size", udpBatchSize).Msg("UDP batch size")
+		// Actually create DB channels only if saving to Clickhouse
+		if saveClickhouseDB {
+			l.Info().Int("size", tcpBatchSize).Msg("TCP batch size")
+			l.Info().Int("size", udpBatchSize).Msg("UDP batch size")
 
-		// IMPORTANT: ClickHouse batching should be single-writer per table to avoid pool starvation.
-		go SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
-		go SaveUDPPackets(connection, udpQueue, udpBatchSize)
+			connection, err := db.Connect()
+			if err != nil {
+				l.Fatal().Err(err).Msg("Couldnt establish connection to database")
+			}
+			l.Info().Msg("Database connection set up!")
+
+			tcpQueue = make(chan netutil.TcpPacket, channelSize)
+			udpQueue = make(chan netutil.UdpPacket, channelSize)
+
+			go db.SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
+			go db.SaveUDPPackets(connection, udpQueue, udpBatchSize)
+		}
 
 		// Open the network interface for packet capture
+
 		handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
 		if err != nil {
-			logger.Fatal().Err(err).Msg("fatal: opening interface")
+			l.Fatal().Err(err).Msg("fatal: opening interface")
 		}
 		defer handle.Close()
 
-		// create outbound thread
+		// Create outbound thread for replies
+
 		packetQueue = make(chan []byte, channelSize)
 		go sendthread(interfaceName, packetQueue)
 
-		logger.Info().Str("filter", filter).Msg("set bpf filter")
 		if err := handle.SetBPFFilter(filter); err != nil {
-			logger.Fatal().Err(err).Msg("fatal: setting bpf filter")
+			l.Fatal().Err(err).Msg("fatal: setting bpf filter")
 		}
+		l.Info().Str("filter", filter).Msg("set bpf filter")
+		l.Info().Str("interface", interfaceName).Msg("Listening on interface")
 
-		logger.Info().Str("interface", interfaceName).Msg("Listening on interface")
+		// Start packet capture loop. Make it loop infinitely in case it ever fails
 
-		reflectPayloads := c.Bool("udp-reflect")
-		if reflectPayloads {
-			logger.Info().Msg("reflecting udp scanners payloads")
-		}
+		udpCfg := udprl.ConfigFromEnv()
 
-		// Make the thread loop infinitely in case it ever fails
 		for {
-
-			var udpLimiter *UdpRateLimiter
-			// Init rate limiter
+			var udpLimiter *udprl.Limiter
 			if udpspoofing {
-				udpLimiter = NewUdpRateLimiter()
+				udpLimiter = udprl.New(udpCfg)
 			}
+			var udpReplyCode int
 
-			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
-
 				// Only process IPv4
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
-
 					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-						logger.Trace().Msg("new TCP/IPv4 packet read")
+						l.Trace().Msg("new TCP/IPv4 packet read")
 						if synspoofing {
 							SendSYNACK(packet, packetQueue)
 						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-						logger.Trace().Msg("new UDP/IPv4 packet read")
+						l.Trace().Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
-							SendUDPReply(packet, packetQueue, udpLimiter, reflectPayloads)
+							udpReplyCode = SendUDPReply(packet, packetQueue, udpLimiter)
+							if saveClickhouseDB && udpReplyCode == UDP_REPLY_BLOCKED && saveBlockedUDP {
+								savePackets(packet, tcpQueue, udpQueue)
+								continue
+							}
 						}
 					} else {
 						// Not saving anything else for now
-						logger.Trace().Msg("new OtherProto/IPv4 packet read")
+						l.Trace().Msg("new OtherProto/IPv4 packet read")
 						continue
 					}
 
-					savePackets(packet, tcpQueue, udpQueue)
+					if saveClickhouseDB {
+						savePackets(packet, tcpQueue, udpQueue)
+					}
 				}
 			}
-			logger.Warn().Msg("out of packetSource loop, starting again")
+			l.Warn().Msg("out of packetSource loop, starting again")
 		}
 	}
 
 	if err := app.Run(os.Args); err != nil {
-		logger.Fatal().Err(err).Msg("fatal: running app")
+		l.Fatal().Err(err).Msg("fatal: running app")
 	}
 }
 
-// Save to DB - This code you probably do not really need to touch, it is specific to our DB.
-func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue chan (UdpPacket)) {
+// Save packet to DB
+func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQueue chan (netutil.UdpPacket)) {
 	timestamp := packet.Metadata().Timestamp.Unix() * 1000
 	// Get IP layer
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
@@ -242,10 +260,10 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 	if ipLayer != nil {
 		ip, _ := ipLayer.(*layers.IPv4)
 
-		var ippacket IpPacket
+		var ippacket netutil.IpPacket
 		ippacket.Timestamp = timestamp
-		ippacket.SrcIP = Ip2int(ip.SrcIP)
-		ippacket.DstIP = Ip2int(ip.DstIP)
+		ippacket.SrcIP = netutil.IPv4ToUint32(ip.SrcIP.To4())
+		ippacket.DstIP = netutil.IPv4ToUint32(ip.DstIP.To4())
 		ippacket.IHL = ip.IHL
 		ippacket.TOS = ip.TOS
 		ippacket.Length = ip.Length
@@ -259,7 +277,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 			tcp, _ := tcpLayer.(*layers.TCP)
 
-			var tcppacket TcpPacket
+			var tcppacket netutil.TcpPacket
 			tcppacket.IpPacket = ippacket
 			tcppacket.SrcPort = uint16(tcp.SrcPort)
 			tcppacket.DstPort = uint16(tcp.DstPort)
@@ -278,7 +296,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 			tcppacket.Window = tcp.Window
 			tcppacket.Checksum = tcp.Checksum
 			tcppacket.Urgent = tcp.Urgent
-			tcppacket.Options = SerializeTCPOptions(tcp.Options)
+			tcppacket.Options = serializeTCPOptions(tcp.Options)
 			tcppacket.Payload = b64.StdEncoding.EncodeToString(tcp.Payload)
 
 			select {
@@ -286,8 +304,8 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 			default:
 				staticDropLog.count++
 				now := time.Now()
-				if now.Sub(staticDropLog.last) > time.Second {
-					logger.Warn().Int("dropped", staticDropLog.count).Msg("tcp queue full, dropping packets to avoid capture stall")
+				if now.Sub(staticDropLog.last) > time.Duration(staticDropLogSeconds)*time.Second {
+					l.Warn().Int("dropped", staticDropLog.count).Msg("tcp queue full, dropping packets to avoid capture stall")
 					staticDropLog.count = 0
 					staticDropLog.last = now
 				}
@@ -296,7 +314,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 		} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 			udp, _ := udpLayer.(*layers.UDP)
 
-			var udppacket UdpPacket
+			var udppacket netutil.UdpPacket
 			udppacket.IpPacket = ippacket
 			udppacket.SrcPort = uint16(udp.SrcPort)
 			udppacket.DstPort = uint16(udp.DstPort)
@@ -308,8 +326,8 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 			default:
 				staticDropLog.count++
 				now := time.Now()
-				if now.Sub(staticDropLog.last) > time.Second {
-					logger.Warn().Int("dropped", staticDropLog.count).Msg("udp queue full, dropping packets to avoid capture stall")
+				if now.Sub(staticDropLog.last) > time.Duration(staticDropLogSeconds)*time.Second {
+					l.Warn().Int("dropped", staticDropLog.count).Msg("udp queue full, dropping packets to avoid capture stall")
 					staticDropLog.count = 0
 					staticDropLog.last = now
 				}
@@ -319,7 +337,7 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (TcpPacket), udpQueue cha
 }
 
 // Yeah this is janky, but it works. Not very efficient though
-func SerializeTCPOptions(options []layers.TCPOption) string {
+func serializeTCPOptions(options []layers.TCPOption) string {
 	// Convert each TCPOption to a map[string]interface{} for JSON encoding
 	convertedOptions := make([]map[string]interface{}, len(options))
 	for i, opt := range options {
@@ -339,30 +357,22 @@ func SerializeTCPOptions(options []layers.TCPOption) string {
 	return string(tcpOptionsJSON)
 }
 
-func Ip2int(ip net.IP) uint32 {
-	if len(ip) == 16 {
-		panic("no sane way to convert ipv6 into uint32")
-	}
-	return binary.BigEndian.Uint32(ip)
-}
-
 func sendthread(interfaceName string, packetQueue chan []byte) {
-	// Open the network interface for packet capture
+
 	handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("sendthread: error opening interface")
+		l.Fatal().Err(err).Msg("sendthread: error opening interface")
 	}
 	defer handle.Close()
 
-	logger.Info().Str("iface", interfaceName).Msg("sending replies on interface")
+	l.Info().Str("iface", interfaceName).Msg("interface")
 
 	for {
 		packet := <-packetQueue
 
-		// Send the packet
 		err = handle.WritePacketData(packet)
 		if err != nil {
-			logger.Error().Err(err).
+			l.Error().Err(err).
 				Str("packet", string(packet)).
 				Msg("error sending packet")
 		}
@@ -416,13 +426,13 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 				ipLayer,
 				tcpLayer,
 			); err != nil {
-				logger.Error().Err(err).Msg("serialize tcp packet error")
+				l.Error().Err(err).Msg("serialize tcp packet error")
 				return
 			}
 
 			packetQueue <- buffer.Bytes()
 
-			logger.Debug().
+			l.Debug().
 				Str("src_ip", ipLayer.SrcIP.String()).Str("dst_ip", ipLayer.DstIP.String()).
 				Uint16("src_port", uint16(tcpLayer.SrcPort)).Uint16("dst_port", uint16(tcpLayer.DstPort)).
 				Msg("SYN-ACK sent")
@@ -469,13 +479,13 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 				ipLayer,
 				tcpLayer,
 			); err != nil {
-				logger.Error().Err(err).Msg("serialize tcp packet error")
+				l.Error().Err(err).Msg("serialize tcp packet error")
 				return
 			}
 
 			packetQueue <- buffer.Bytes()
 
-			logger.Debug().
+			l.Debug().
 				Str("src_ip", ipLayer.SrcIP.String()).Str("dst_ip", ipLayer.DstIP.String()).
 				Uint16("src_port", uint16(tcpLayer.SrcPort)).Uint16("dst_port", uint16(tcpLayer.DstPort)).
 				Msg("ACK sent")
@@ -483,14 +493,20 @@ func SendSYNACK(packet gopacket.Packet, packetQueue chan []byte) {
 	}
 }
 
-// Take the incoming UDP packet, and reply with the values from the packet.
-// Assumes packet is IPv4
-func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLimiter, reflect bool) {
+const (
+	UDP_REPLY_ERROR   int = -1
+	UDP_REPLY_SENT    int = 0
+	UDP_REPLY_BLOCKED int = 1
+)
+
+// Take the incoming UDP packet, and reply with the values from the packet. Assumes packet is IPv4
+// Returns UDP_REPLY_* value
+func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Limiter) int {
 
 	udpLay := packet.Layer(layers.LayerTypeUDP)
 	ipLay := packet.Layer(layers.LayerTypeIPv4)
 	if udpLay == nil || ipLay == nil {
-		return
+		return UDP_REPLY_ERROR
 	}
 
 	ip, _ := ipLay.(*layers.IPv4)
@@ -498,16 +514,16 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 
 	// AmpPot-style rate limit
 	if !rl.Allow(ip.SrcIP, ip.DstIP, uint16(udp.DstPort)) {
-		logger.Debug().
+		l.Debug().
 			Str("src_ip", ip.SrcIP.String()).Str("dst_ip", ip.DstIP.String()).
 			Uint16("src_port", uint16(udp.SrcPort)).Uint16("dst_port", uint16(udp.DstPort)).
 			Msg("PACKET BLOCKED")
-		return
+		return UDP_REPLY_BLOCKED
 	}
 
 	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
 	if ethernetLayer == nil {
-		return
+		return UDP_REPLY_ERROR
 	}
 	ethernet, _ := ethernetLayer.(*layers.Ethernet)
 
@@ -535,331 +551,28 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *UdpRateLi
 
 	buffer := gopacket.NewSerializeBuffer()
 
-	if reflect {
-		if err := gopacket.SerializeLayers(
-			buffer,
-			gopacket.SerializeOptions{
-				FixLengths:       true,
-				ComputeChecksums: true,
-			},
-			ethLayer,
-			ipLayer,
-			udpLayer,
-			gopacket.Payload(udp.Payload),
-		); err != nil {
-			logger.Error().Err(err).Msg("serialize udp packet error")
-			return
-		}
-	} else {
-		if err := gopacket.SerializeLayers(
-			buffer,
-			gopacket.SerializeOptions{
-				FixLengths:       true,
-				ComputeChecksums: true,
-			},
-			ethLayer,
-			ipLayer,
-			udpLayer,
-		); err != nil {
-			logger.Error().Err(err).Msg("serialize udp packet error")
-			return
-		}
+	if err := gopacket.SerializeLayers(
+		buffer,
+		gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		},
+		ethLayer,
+		ipLayer,
+		udpLayer,
+	); err != nil {
+		l.Error().Err(err).Msg("serialize udp packet error")
+		return UDP_REPLY_ERROR
 	}
 
 	packetQueue <- buffer.Bytes()
 
-	logger.Debug().
+	l.Debug().
 		Str("src_ip", ipLayer.SrcIP.String()).
 		Str("dst_ip", ipLayer.DstIP.String()).
 		Uint16("src_port", uint16(udpLayer.SrcPort)).
 		Uint16("dst_port", uint16(udpLayer.DstPort)).
 		Msg("UDP sent")
-}
 
-// use godot package to load/read the .env file and
-// return the value of the key
-func GoDotEnvVariable(key string) string {
-
-	// load .env file
-	err := godotenv.Load(".env")
-
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Error loading .env file")
-	}
-
-	return os.Getenv(key)
-}
-
-// Get Env var as int with default fallback
-func GetEnvInt(key string, def int) int {
-	val := GoDotEnvVariable(key)
-	if val == "" {
-		return def
-	}
-	i, err := strconv.Atoi(val)
-	if err != nil {
-		return def
-	}
-	return i
-}
-
-// Function to connect to a Clickhouse database. NOTE: TLS is disabled at this moment. To allow for TLS, we should include this here.
-// It is running internally, so for now w/e
-func Connect() (driver.Conn, error) {
-	var (
-		ctx       = context.Background()
-		conn, err = clickhouse.Open(&clickhouse.Options{
-			Addr: []string{GoDotEnvVariable("DATABASE_HOST") + ":" + GoDotEnvVariable("DATABASE_PORT")},
-			Auth: clickhouse.Auth{
-				Database: GoDotEnvVariable("DATABASE"),
-				Username: GoDotEnvVariable("DATABASE_USER"),
-				Password: GoDotEnvVariable("DATABASE_PASSWORD"),
-			},
-			ClientInfo: clickhouse.ClientInfo{
-				Products: []struct {
-					Name    string
-					Version string
-				}{
-					{Name: GoDotEnvVariable("DATABASE_CLIENT_NAME"), Version: GoDotEnvVariable("VERSION")},
-				},
-			},
-
-			Debugf: func(format string, v ...interface{}) {
-				fmt.Printf(format, v)
-			},
-			// TLS: &tls.Config{
-			// 	InsecureSkipVerify: true,
-			// },
-		})
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if err := conn.Ping(ctx); err != nil {
-		if exception, ok := err.(*clickhouse.Exception); ok {
-			fmt.Printf("Exception [%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
-		}
-		return nil, err
-	}
-
-	return conn, nil
-}
-
-func Query(conn driver.Conn, query string) (driver.Rows, error) {
-	ctx := context.Background()
-	rows, err := conn.Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-//////// SOME HELPER STUFF /////////
-
-type Packet struct {
-	Timestamp int64
-	Flush     bool `default:"false"`
-}
-
-type IpPacket struct {
-	Packet
-	SrcIP, DstIP uint32
-	IHL          uint8
-	TOS          uint8
-	Length       uint16
-	IpId         uint16
-	Flags        uint8
-	FragOffset   uint16
-	TTL          uint8
-	Protocol     uint8
-	Checksum     uint16
-}
-
-type TcpPacket struct {
-	IpPacket
-	SrcPort, DstPort                           uint16
-	Seq                                        uint32
-	Ack                                        uint32
-	DataOffset                                 uint8
-	FIN, SYN, RST, PSH, ACK, URG, ECE, CWR, NS bool
-	Window                                     uint16
-	TCPChecksum                                uint16
-	Urgent                                     uint16
-	Options                                    string
-	Payload                                    string
-}
-
-type UdpPacket struct {
-	IpPacket
-	SrcPort, DstPort uint16
-	UDPLength        uint16
-	UDPChecksum      uint16
-	Payload          string
-}
-
-func prepareBatch(conn driver.Conn, table string) (driver.Batch, error) {
-	ctx := context.Background()
-	header := fmt.Sprintf("INSERT INTO %s ", table)
-	return conn.PrepareBatch(ctx, header, driver.WithReleaseConnection())
-}
-
-// Single-writer UDP batcher: no concurrent Send/PrepareBatch to avoid ClickHouse pool starvation.
-func SaveUDPPackets(conn driver.Conn, udpQueue chan (UdpPacket), batchSize int) {
-	current, err := prepareBatch(conn, "udppackets")
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Error preparing UDP batch")
-	}
-	logger.Info().Msg("UDP batch created...")
-
-	inBatch := 0
-
-	flush := func() {
-		if inBatch == 0 {
-			return
-		}
-		logger.Info().Str("proto", "udp").Int("batch_size", inBatch).Msg("saving batch to clickhouse")
-		if err := current.Send(); err != nil {
-			logger.Error().Err(err).Msg("udp batch send error")
-			// Drop the batch and try to recreate on next packet.
-		}
-
-		current, err = prepareBatch(conn, "udppackets")
-		if err != nil {
-			logger.Error().Err(err).Msg("udp prepare new batch error")
-			current = nil
-		} else {
-			logger.Debug().Msg("prepare new UDP batch after send")
-		}
-		inBatch = 0
-	}
-
-	for {
-		pkt := <-udpQueue
-		if pkt.Flush || inBatch >= batchSize {
-			flush()
-			if pkt.Flush {
-				continue
-			}
-		}
-
-		if current == nil {
-			current, err = prepareBatch(conn, "udppackets")
-			if err != nil {
-				logger.Error().Err(err).Msg("udp re-prepare batch error; will retry on next packet")
-				continue
-			}
-			logger.Debug().Msg("prepared new UDP batch after previous error")
-		}
-
-		err = current.Append(
-			pkt.Timestamp,
-			pkt.SrcIP,
-			pkt.DstIP,
-			pkt.IHL,
-			pkt.TOS,
-			pkt.Length,
-			pkt.IpId,
-			pkt.Flags,
-			pkt.FragOffset,
-			pkt.TTL,
-			pkt.Protocol,
-			pkt.SrcPort,
-			pkt.DstPort,
-			pkt.UDPLength,
-			pkt.Payload,
-		)
-		if err != nil {
-			logger.Error().Err(err).Msg("ERROR in batching UDPPacket")
-			continue
-		}
-		inBatch++
-	}
-}
-
-// Single-writer TCP batcher: no concurrent Send/PrepareBatch to avoid ClickHouse pool starvation.
-func SaveTCPPackets(conn driver.Conn, tcpQueue chan (TcpPacket), batchSize int) {
-	current, err := prepareBatch(conn, "tcppackets")
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Error preparing TCP batch")
-	}
-	logger.Info().Msg("TCP batch created...")
-
-	inBatch := 0
-
-	flush := func() {
-		if inBatch == 0 {
-			return
-		}
-		logger.Info().Str("proto", "tcp").Int("batch_size", inBatch).Msg("saving batch to clickhouse")
-		if err := current.Send(); err != nil {
-			logger.Error().Err(err).Msg("tcp batch send error")
-		}
-
-		current, err = prepareBatch(conn, "tcppackets")
-		if err != nil {
-			logger.Error().Err(err).Msg("tcp prepare new batch error")
-			current = nil
-		} else {
-			logger.Debug().Msg("prepare new TCP batch after send")
-		}
-		inBatch = 0
-	}
-
-	for {
-		pkt := <-tcpQueue
-		if pkt.Flush || inBatch >= batchSize {
-			flush()
-			if pkt.Flush {
-				continue
-			}
-		}
-
-		if current == nil {
-			current, err = prepareBatch(conn, "tcppackets")
-			if err != nil {
-				logger.Error().Err(err).Msg("tcp re-prepare batch error; will retry on next packet")
-				continue
-			}
-			logger.Debug().Msg("prepared new TCP batch after previous error")
-		}
-
-		err = current.Append(
-			pkt.Timestamp,
-			pkt.SrcIP,
-			pkt.DstIP,
-			pkt.IHL,
-			pkt.TOS,
-			pkt.Length,
-			pkt.IpId,
-			pkt.Flags,
-			pkt.FragOffset,
-			pkt.TTL,
-			pkt.Protocol,
-			pkt.SrcPort,
-			pkt.DstPort,
-			pkt.Seq,
-			pkt.Ack,
-			pkt.DataOffset,
-			pkt.FIN,
-			pkt.SYN,
-			pkt.RST,
-			pkt.PSH,
-			pkt.ACK,
-			pkt.URG,
-			pkt.ECE,
-			pkt.CWR,
-			pkt.NS,
-			pkt.Window,
-			pkt.Urgent,
-			pkt.Options,
-			pkt.Payload,
-		)
-		if err != nil {
-			logger.Error().Err(err).Msg("ERROR in batching TCPPacket")
-			continue
-		}
-		inBatch++
-	}
+	return UDP_REPLY_SENT
 }
