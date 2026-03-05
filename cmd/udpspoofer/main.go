@@ -2,7 +2,6 @@ package main
 
 import (
 	b64 "encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"math/rand"
 	"os"
@@ -12,11 +11,8 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/rs/zerolog"
+	zl "github.com/rs/zerolog"
 	"github.com/urfave/cli"
-
-	// "github.com/rs/zerolog"
-	// "github.com/rs/zerolog/log"
 
 	"udpspoofer/internal/config"
 	"udpspoofer/internal/db"
@@ -25,7 +21,7 @@ import (
 	udprl "udpspoofer/internal/ratelimit/udp"
 )
 
-var l zerolog.Logger
+var l zl.Logger
 var packetQueue chan []byte
 
 const MaxPacketSize = 65536 // Maximum packet size
@@ -55,7 +51,6 @@ func main() {
 	}
 
 	app.Action = func(c *cli.Context) error {
-		zerolog.TimeFieldFormat = time.RFC3339Nano
 
 		// Load .env exactly once (matching current behavior: fatal if missing).
 		if err := config.LoadDotEnvOnce(".env"); err != nil {
@@ -180,7 +175,7 @@ func main() {
 			var udpLimiter *udprl.Limiter
 			// Init rate limiter
 			if udpspoofing {
-				udpLimiter = udprl.New(udpCfg, logger)
+				udpLimiter = udprl.New(udpCfg)
 			}
 
 			// Packet capture loop
@@ -556,7 +551,3 @@ func SendUDPReply(packet gopacket.Packet, packetQueue chan []byte, rl *udprl.Lim
 		Uint16("dst_port", uint16(udpLayer.DstPort)).
 		Msg("UDP sent")
 }
-
-// NOTE: this file still imports encoding/binary for other code paths, but Ip2int is now unused.
-// If you want, we can remove encoding/binary import and any remaining uses in a follow-up cleanup.
-var _ = binary.BigEndian

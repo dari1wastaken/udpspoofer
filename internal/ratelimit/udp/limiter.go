@@ -5,8 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog"
+	zl "github.com/rs/zerolog"
 
+	log "udpspoofer/internal/log"
 	"udpspoofer/internal/netutil"
 )
 
@@ -23,7 +24,7 @@ type Limiter struct {
 	mu sync.Mutex
 
 	cfg Config
-	log zerolog.Logger
+	l   zl.Logger
 
 	ipRates  map[uint32]*rateEntry
 	subRates map[uint32]*rateEntry
@@ -36,10 +37,10 @@ type Limiter struct {
 	ticks int
 }
 
-func New(cfg Config, log zerolog.Logger) *Limiter {
+func New(cfg Config) *Limiter {
 	rl := &Limiter{
 		cfg: cfg,
-		log: log,
+		l:   log.Logger(),
 
 		ipRates:   make(map[uint32]*rateEntry),
 		subRates:  make(map[uint32]*rateEntry),
@@ -47,8 +48,8 @@ func New(cfg Config, log zerolog.Logger) *Limiter {
 		blockedIP: make(map[uint32]*blockEntry),
 		blocked24: make(map[uint32]*blockEntry),
 
-		// Key: (DstIP_last2bytes << 16) | DstPort
-		// We won't monitor more than one IPv4 /16 anyway.
+		// Key: (DstIP << 16) | DstPort
+		// We won't monitor more than one IPv4 /16, this reduces key size.
 		blockedEndpoints: make(map[uint32]*blockEntry),
 	}
 
@@ -74,13 +75,13 @@ func (r *Limiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 	// Block check
 	src := netutil.IPv4ToUint32(src4)
 	if b, ok := r.blockedIP[src]; ok && now.Before(b.until) {
-		r.log.Debug().Str("src_ip", src4.String()).Msg("REASON srcIP blocked")
+		r.l.Debug().Str("src_ip", src4.String()).Msg("REASON srcIP blocked")
 		return false
 	}
 
 	subnet := src & 0xFFFFFF00
 	if b, ok := r.blocked24[subnet]; ok && now.Before(b.until) {
-		r.log.Debug().Str("subnet", src4.String()).Msg("REASON subnet blocked")
+		r.l.Debug().Str("subnet", src4.String()).Msg("REASON subnet blocked")
 		return false
 	}
 
@@ -88,28 +89,28 @@ func (r *Limiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 	// (dst4[2], dst4[3]) are safe now because dst4 is exactly 4 bytes.
 	dst := (uint32(dst4[2]) << 24) | (uint32(dst4[3]) << 16) | uint32(dstPort)
 	if b, ok := r.blockedEndpoints[dst]; ok && now.Before(b.until) {
-		r.log.Debug().Str("dst_ip", dst4.String()).Uint16("dst_port", dstPort).Msg("REASON endpoint blocked")
+		r.l.Debug().Str("dst_ip", dst4.String()).Uint16("dst_port", dstPort).Msg("REASON endpoint blocked")
 		return false
 	}
 
 	// IP rate
 	if !r.bump(r.ipRates, src, r.cfg.IPLimit, now) {
 		r.blockedIP[src] = &blockEntry{until: now.Add(r.cfg.BlockTTL)}
-		r.log.Info().Str("src_ip", src4.String()).Msg("BLOCKING Source IP")
+		r.l.Info().Str("src_ip", src4.String()).Msg("BLOCKING Source IP")
 		return false
 	}
 
 	// /24 rate
 	if !r.bump(r.subRates, subnet, r.cfg.SubnetLimit, now) {
 		r.blocked24[subnet] = &blockEntry{until: now.Add(r.cfg.BlockTTL)}
-		r.log.Info().Str("src_net", src4.String()).Msg("BLOCKING Source /24")
+		r.l.Info().Str("src_net", src4.String()).Msg("BLOCKING Source /24")
 		return false
 	}
 
 	// Endpoint rate
 	if !r.bump(r.epRates, dst, r.cfg.EndpointLimit, now) {
 		r.blockedEndpoints[dst] = &blockEntry{until: now.Add(r.cfg.BlockTTL)}
-		r.log.Info().Str("dst_ip", dst4.String()).Uint16("dst_port", dstPort).Msg("BLOCKING Endpoint")
+		r.l.Info().Str("dst_ip", dst4.String()).Uint16("dst_port", dstPort).Msg("BLOCKING Endpoint")
 		return false
 	}
 
@@ -133,7 +134,7 @@ func (r *Limiter) bump(m map[uint32]*rateEntry, key uint32, limit int, now time.
 
 func (r *Limiter) cleanupLoop() {
 	ticker := time.NewTicker(r.cfg.CleanupInterval)
-	r.log.Info().
+	r.l.Info().
 		Dur("interval", r.cfg.CleanupInterval).
 		Int("udp_entry_cleanup_intervals", r.cfg.EntryCleanupIntervals).
 		Msg("cleanup loop interval")
@@ -162,14 +163,14 @@ func (r *Limiter) cleanupLoop() {
 
 		r.ticks++
 
-		r.log.Info().
+		r.l.Info().
 			Time("time", now).
 			Int("src_ips", len(r.ipRates)).
 			Int("src_24s", len(r.subRates)).
 			Int("endpoints", len(r.epRates)).
 			Msg("current tracked entries")
 
-		r.log.Info().
+		r.l.Info().
 			Time("time", now).
 			Int("src_ips", len(r.blockedIP)).
 			Int("src_24s", len(r.blocked24)).
@@ -180,21 +181,21 @@ func (r *Limiter) cleanupLoop() {
 		for k, v := range r.blockedIP {
 			if now.After(v.until) {
 				delete(r.blockedIP, k)
-				r.log.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked IP")
+				r.l.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked IP")
 				cleanedBlockedIPs++
 			}
 		}
 		for k, v := range r.blocked24 {
 			if now.After(v.until) {
 				delete(r.blocked24, k)
-				r.log.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked Net")
+				r.l.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked Net")
 				cleanedBlockedNets++
 			}
 		}
 		for k, v := range r.blockedEndpoints {
 			if now.After(v.until) {
 				delete(r.blockedEndpoints, k)
-				r.log.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked EP")
+				r.l.Debug().Time("time", now).Uint32("key", k).Msg("CLEAN blocked EP")
 				cleanedBlockedEPs++
 			}
 		}
@@ -221,7 +222,7 @@ func (r *Limiter) cleanupLoop() {
 			}
 		}
 
-		r.log.Info().
+		r.l.Info().
 			Time("time", now).
 			Int64("blocked_src_ips", cleanedBlockedIPs).
 			Int64("blocked_src_24s", cleanedBlockedNets).
