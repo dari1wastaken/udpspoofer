@@ -138,9 +138,7 @@ func main() {
 		channelSize := config.GetInt("CHANNEL_SIZE", 100000)
 		l.Info().Int("size", channelSize).Msg("channel size")
 
-		tcpQueue = make(chan netutil.TcpPacket, channelSize)
-		udpQueue = make(chan netutil.UdpPacket, channelSize)
-
+		// Init batch sizes regardless of using Clickhouse
 		var tcpBatchSize, udpBatchSize int
 
 		if synspoofing && udpspoofing {
@@ -161,26 +159,33 @@ func main() {
 			filter += " and (tcp or udp)"
 		}
 
-		l.Info().Int("size", tcpBatchSize).Msg("TCP batch size")
-		l.Info().Int("size", udpBatchSize).Msg("UDP batch size")
+		// Actually create DB channels only if saving to Clickhouse
+		if saveClickhouseDB {
+			l.Info().Int("size", tcpBatchSize).Msg("TCP batch size")
+			l.Info().Int("size", udpBatchSize).Msg("UDP batch size")
 
-		connection, err := db.Connect()
-		if err != nil {
-			l.Fatal().Err(err).Msg("Couldnt establish connection to database")
+			connection, err := db.Connect()
+			if err != nil {
+				l.Fatal().Err(err).Msg("Couldnt establish connection to database")
+			}
+			l.Info().Msg("Database connection set up!")
+
+			tcpQueue = make(chan netutil.TcpPacket, channelSize)
+			udpQueue = make(chan netutil.UdpPacket, channelSize)
+
+			go db.SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
+			go db.SaveUDPPackets(connection, udpQueue, udpBatchSize)
 		}
-		l.Info().Msg("Database connection set up!")
-
-		go db.SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
-		go db.SaveUDPPackets(connection, udpQueue, udpBatchSize)
 
 		// Open the network interface for packet capture
+
 		handle, err := pcap.OpenLive(interfaceName, MaxPacketSize, true, pcap.BlockForever)
 		if err != nil {
 			l.Fatal().Err(err).Msg("fatal: opening interface")
 		}
 		defer handle.Close()
 
-		// Create outbound thread
+		// Create outbound thread for replies
 
 		packetQueue = make(chan []byte, channelSize)
 		go sendthread(interfaceName, packetQueue)
@@ -191,11 +196,10 @@ func main() {
 		l.Info().Str("filter", filter).Msg("set bpf filter")
 		l.Info().Str("interface", interfaceName).Msg("Listening on interface")
 
-		// Start packet capture loop
+		// Start packet capture loop. Make it loop infinitely in case it ever fails
 
 		udpCfg := udprl.ConfigFromEnv()
 
-		// Make the thread loop infinitely in case it ever fails
 		for {
 			var udpLimiter *udprl.Limiter
 			if udpspoofing {
@@ -217,7 +221,7 @@ func main() {
 						l.Trace().Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
 							udpReplyCode = SendUDPReply(packet, packetQueue, udpLimiter)
-							if udpReplyCode == UDP_REPLY_BLOCKED && saveBlockedUDP {
+							if saveClickhouseDB && udpReplyCode == UDP_REPLY_BLOCKED && saveBlockedUDP {
 								savePackets(packet, tcpQueue, udpQueue)
 								continue
 							}
@@ -228,7 +232,9 @@ func main() {
 						continue
 					}
 
-					savePackets(packet, tcpQueue, udpQueue)
+					if saveClickhouseDB {
+						savePackets(packet, tcpQueue, udpQueue)
+					}
 				}
 			}
 			l.Warn().Msg("out of packetSource loop, starting again")
