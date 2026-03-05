@@ -48,11 +48,20 @@ func main() {
 			Name:  "udp-reflect",
 			Usage: "Send the same UDP payload back to the source",
 		},
+		cli.BoolFlag{
+			Name:  "save-clickhouse-db",
+			Usage: "Save packets to Clickhouse tables",
+		},
+		cli.BoolFlag{
+			Name:  "save-blocked-udp",
+			Usage: "Save UDP packets that have been blocked by the rate limiter (useless without udp spoofing and save-clickhouse-db)",
+		},
 	}
 
 	app.Action = func(c *cli.Context) error {
 
-		// Load .env exactly once (matching current behavior: fatal if missing).
+		// Setup logger
+
 		if err := config.LoadDotEnvOnce(".env"); err != nil {
 			// logger isn't configured yet
 			panic("Error loading .env file")
@@ -61,33 +70,26 @@ func main() {
 		log.Setup(config.GetString("LOG_LEVEL", ""))
 		l = log.Logger()
 
-		interfaceName := c.String("interface")
-		serverAddrStr := c.String("subnet")
-		synspoofing := false
-		udpspoofing := false
+		// Parse CLI flags
 
+		interfaceName := c.String("interface")
+		if interfaceName == "" {
+			l.Warn().Msg(c.App.Usage)
+			l.Fatal().Msg("Please provide a subnet to spoof...")
+		}
+
+		serverAddrStr := c.String("subnet")
 		if serverAddrStr == "" {
 			l.Fatal().Msg("Please provide a subnet to spoof...")
 		}
 
+		// TODO: these can be two separate bool flags
 		protoStr := c.String("protocols")
 		protocols := strings.Split(protoStr, ",")
 
-		connection, err := db.Connect()
-		if err != nil {
-			l.Fatal().Err(err).Msg("Couldnt establish connection to database")
-		}
-		l.Info().Msg("Database connection set up!")
+		synspoofing := false
+		udpspoofing := false
 
-		// Build a robust BPF filter depending on host vs CIDR
-		var filter string
-		if strings.Contains(serverAddrStr, "/") {
-			filter = "(inbound and net " + serverAddrStr + ")"
-		} else {
-			filter = "(inbound and host " + serverAddrStr + ")"
-		}
-
-		// Parse proto flags into bools
 		for _, proto := range protocols {
 			switch proto {
 			case "tcp":
@@ -107,13 +109,40 @@ func main() {
 			}
 		}
 
-		// Init protocol channels and update packet filter
+		reflectPayloads := c.Bool("udp-reflect")
+		if reflectPayloads {
+			l.Info().Msg("reflecting udp scanners payloads back at them")
+		}
+
+		saveClickhouseDB := c.Bool("save-clickhouse-db")
+		if saveClickhouseDB {
+			l.Info().Msg("saving data to clickhouse")
+		}
+
+		saveBlockedUDP := c.Bool("save-blocked-udp")
+		if saveBlockedUDP {
+			l.Info().Msg("saving UDP packets blocked by the rate limiter")
+		}
+
+		// Build BPF filter
+		// - single host vs CIDR
+		// - Incoming TCP RST/FIN dropped when reacting
+		// - Still collecting either transport regardless
+
+		var filter string
+		if strings.Contains(serverAddrStr, "/") {
+			filter = "(inbound and net " + serverAddrStr + ")"
+		} else {
+			filter = "(inbound and host " + serverAddrStr + ")"
+		}
+
+		// Init protocol channel sizes and BPF filter
+
 		var tcpQueue chan netutil.TcpPacket
 		var udpQueue chan netutil.UdpPacket
 
-		// Load configurable channel size
 		channelSize := config.GetInt("CHANNEL_SIZE", 100000)
-		l.Info().Int("size", channelSize).Msg("CHANNEL_SIZE")
+		l.Info().Int("size", channelSize).Msg("channel size")
 
 		tcpQueue = make(chan netutil.TcpPacket, channelSize)
 		udpQueue = make(chan netutil.UdpPacket, channelSize)
@@ -141,7 +170,12 @@ func main() {
 		l.Info().Int("size", tcpBatchSize).Msg("TCP batch size")
 		l.Info().Int("size", udpBatchSize).Msg("UDP batch size")
 
-		// IMPORTANT: ClickHouse batching should be single-writer per table to avoid pool starvation.
+		connection, err := db.Connect()
+		if err != nil {
+			l.Fatal().Err(err).Msg("Couldnt establish connection to database")
+		}
+		l.Info().Msg("Database connection set up!")
+
 		go db.SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
 		go db.SaveUDPPackets(connection, udpQueue, udpBatchSize)
 
@@ -152,21 +186,18 @@ func main() {
 		}
 		defer handle.Close()
 
-		// create outbound thread
+		// Create outbound thread
+
 		packetQueue = make(chan []byte, channelSize)
 		go sendthread(interfaceName, packetQueue)
 
-		l.Info().Str("filter", filter).Msg("set bpf filter")
 		if err := handle.SetBPFFilter(filter); err != nil {
 			l.Fatal().Err(err).Msg("fatal: setting bpf filter")
 		}
-
+		l.Info().Str("filter", filter).Msg("set bpf filter")
 		l.Info().Str("interface", interfaceName).Msg("Listening on interface")
 
-		reflectPayloads := c.Bool("udp-reflect")
-		if reflectPayloads {
-			l.Info().Msg("reflecting udp scanners payloads")
-		}
+		// Start packet capture loop
 
 		udpCfg := udprl.ConfigFromEnv()
 
@@ -178,7 +209,6 @@ func main() {
 				udpLimiter = udprl.New(udpCfg)
 			}
 
-			// Packet capture loop
 			packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 			for packet := range packetSource.Packets() {
 				// Only process IPv4
