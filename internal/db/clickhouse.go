@@ -11,8 +11,6 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
-var l = log.Logger()
-
 // Connect to a Clickhouse database
 func Connect() (driver.Conn, error) {
 	var (
@@ -70,6 +68,9 @@ func prepareBatch(conn driver.Conn, table string) (driver.Batch, error) {
 
 // Single-writer UDP batcher: no concurrent Send/PrepareBatch to avoid ClickHouse pool starvation.
 func SaveUDPPackets(conn driver.Conn, udpQueue chan (netutil.UdpPacket), batchSize int) {
+
+	l := log.Logger()
+
 	current, err := prepareBatch(conn, "udppackets")
 	if err != nil {
 		l.Fatal().Err(err).Msg("Error preparing UDP batch")
@@ -143,6 +144,9 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (netutil.UdpPacket), batchSi
 
 // Single-writer TCP batcher: no concurrent Send/PrepareBatch to avoid ClickHouse pool starvation.
 func SaveTCPPackets(conn driver.Conn, tcpQueue chan (netutil.TcpPacket), batchSize int) {
+
+	l := log.Logger()
+
 	current, err := prepareBatch(conn, "tcppackets")
 	if err != nil {
 		l.Fatal().Err(err).Msg("Error preparing TCP batch")
