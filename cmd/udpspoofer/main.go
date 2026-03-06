@@ -185,16 +185,18 @@ func main() {
 		}
 		defer handle.Close()
 
-		// Create outbound thread for replies
-
-		packetQueue = make(chan []byte, channelSize)
-		go sendthread(interfaceName, packetQueue)
-
 		if err := handle.SetBPFFilter(filter); err != nil {
 			l.Fatal().Err(err).Msg("fatal: setting bpf filter")
 		}
 		l.Info().Str("filter", filter).Msg("set bpf filter")
-		l.Info().Str("interface", interfaceName).Msg("Listening on interface")
+		l.Info().Str("interface", interfaceName).Msg("listening on interface")
+
+		// Create outbound thread for replies
+
+		if synspoofing || udpspoofing {
+			packetQueue = make(chan []byte, channelSize)
+			go sendthread(interfaceName, packetQueue)
+		}
 
 		// Start packet capture loop. Make it loop infinitely in case it ever fails
 
@@ -365,7 +367,7 @@ func sendthread(interfaceName string, packetQueue chan []byte) {
 	}
 	defer handle.Close()
 
-	l.Info().Str("iface", interfaceName).Msg("interface")
+	l.Info().Str("iface", interfaceName).Msg("sending replies to interface")
 
 	for {
 		packet := <-packetQueue
