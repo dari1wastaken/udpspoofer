@@ -1,0 +1,30 @@
+services:
+  udpspoofer:
+    build:
+      context: .
+      dockerfile: Dockerfile.udpspoofer
+    container_name: udpspoofer-external
+    restart: unless-stopped
+
+    # Required for capturing from the VM interface and crafting L2 replies.
+    # Host networking avoids Docker bridge/NAT and makes pcap on eth0 work as expected.
+    network_mode: host
+
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./external.env:/app/.env:ro
+      - ./docker/entrypoint-external.sh:/entrypoint.sh:ro
+
+    environment:
+      # CLI flags as docker env for entrypoint
+      IFACE: "eth0"
+      SUBNET: "1.1.1.0/24"
+      PROTOCOLS: "udp,tcp"
+      SAVE_CLICKHOUSE_DB: "false"
+      SAVE_BLOCKED_UDP: "false"
+
+    entrypoint: ["/entrypoint.sh"]

@@ -2,9 +2,9 @@
 FROM golang:1.25-alpine AS build
 RUN apk add --no-cache build-base libpcap-dev
 WORKDIR /app
-COPY go.mod go.sum ./
+COPY ../go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY .. .
 # CGO is required for libpcap
 RUN CGO_ENABLED=1 go build -o udpspoofer ./cmd/udpspoofer
 
