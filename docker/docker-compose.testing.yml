@@ -19,8 +19,8 @@ services:
 
   udpspoofer:
     build:
-      context: .
-      dockerfile: Dockerfile.udpspoofer
+      context: ..
+      dockerfile: docker/Dockerfile.udpspoofer
     container_name: udpspoofer
     depends_on:
       - clickhouse
@@ -30,7 +30,7 @@ services:
     security_opt:
       - seccomp:unconfined
     volumes:
-      - ./docker.env:/app/.env:ro
+      - ./testing.env:/app/.env:ro
     networks:
       telescope-net:
         aliases:
@@ -38,8 +38,8 @@ services:
 
   pcap-sender:
     build:
-      context: .
-      dockerfile: Dockerfile.pcap-sender
+      context: ..
+      dockerfile: docker/Dockerfile.pcap-sender
     container_name: pcap-sender
     depends_on:
       - udpspoofer

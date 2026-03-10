@@ -2,9 +2,10 @@
 FROM golang:1.25-alpine AS build
 RUN apk add --no-cache build-base libpcap-dev pkgconfig
 WORKDIR /app
-COPY ../go.mod go.sum ./
+COPY go.mod .
+COPY go.sum .
 RUN go mod download
-COPY cmd/pcap-sender ./cmd/pcap-sender
+COPY ./cmd/pcap-sender ./cmd/pcap-sender
 # CGO is required by gopacket/pcap
 RUN CGO_ENABLED=1 GOOS=linux go build -o pcap-sender ./cmd/pcap-sender
 
@@ -13,5 +14,6 @@ RUN apt update && apt install --yes libpcap-dev tcpdump nmap python3 python3-ven
 WORKDIR /app
 COPY --from=build /app/pcap-sender /app/pcap-sender
 COPY ../scripts/*.py .
+COPY docker/testing.env .env
 RUN python3 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip scapy
 ENTRYPOINT ["sleep", "infinity"]
