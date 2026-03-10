@@ -45,6 +45,7 @@ type TcpPacket struct {
 
 type UdpPacket struct {
 	IpPacket
+	Blocked, Replied bool
 	SrcPort, DstPort uint16
 	UDPLength        uint16
 	UDPChecksum      uint16
