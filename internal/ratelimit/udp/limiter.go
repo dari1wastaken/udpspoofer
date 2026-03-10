@@ -96,21 +96,21 @@ func (r *Limiter) Allow(srcIP, dstIP net.IP, dstPort uint16) bool {
 	// IP rate
 	if !r.bump(r.ipRates, src, r.cfg.IPLimit, now) {
 		r.blockedIP[src] = &blockEntry{until: now.Add(r.cfg.BlockTTL)}
-		r.l.Info().Str("src_ip", src4.String()).Msg("BLOCKING Source IP")
+		r.l.Info().Str("src_ip", src4.String()).Int("minutes", int(r.cfg.BlockTTL.Minutes())).Msg("BLOCKING Source IP")
 		return false
 	}
 
 	// /24 rate
 	if !r.bump(r.subRates, subnet, r.cfg.SubnetLimit, now) {
 		r.blocked24[subnet] = &blockEntry{until: now.Add(r.cfg.BlockTTL)}
-		r.l.Info().Str("src_net", src4.String()).Msg("BLOCKING Source /24")
+		r.l.Info().Str("src_net", src4.String()).Int("minutes", int(r.cfg.BlockTTL.Minutes())).Msg("BLOCKING Source /24")
 		return false
 	}
 
 	// Endpoint rate
 	if !r.bump(r.epRates, dst, r.cfg.EndpointLimit, now) {
 		r.blockedEndpoints[dst] = &blockEntry{until: now.Add(r.cfg.BlockTTL)}
-		r.l.Info().Str("dst_ip", dst4.String()).Uint16("dst_port", dstPort).Msg("BLOCKING Endpoint")
+		r.l.Info().Str("dst_ip", dst4.String()).Uint16("dst_port", dstPort).Int("minutes", int(r.cfg.BlockTTL.Minutes())).Msg("BLOCKING Endpoint")
 		return false
 	}
 
