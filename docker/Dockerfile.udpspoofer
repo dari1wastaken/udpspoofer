@@ -4,6 +4,7 @@ RUN apk add --no-cache build-base libpcap-dev
 WORKDIR /app
 COPY go.mod .
 COPY go.sum .
+COPY ./docker/entrypoint-udpspoofer-testing.sh .
 RUN go mod download
 COPY .. .
 # CGO is required for libpcap
@@ -13,12 +14,7 @@ FROM alpine:3.20
 RUN apk add --no-cache libpcap iptables tcpdump
 WORKDIR /app
 COPY --from=build /app/udpspoofer /app/udpspoofer
-
-# TODO: these iptables rules need to be set at runtime. Ideally add them to an entrypoint
-## Suppress kernel responses on TCP SYNs and UDPs
-# iptables -A OUTPUT -o eth0 -s 172.25.0.3 -p tcp --tcp-flags RST RST -j DROP
-# iptables -A OUTPUT -o eth0 -s 172.25.0.3 -p tcp --tcp-flags FIN FIN -j DROP
-# iptables -A OUTPUT -o eth0 -s 172.25.0.3 -p icmp -j DROP
+COPY --from=build /app/entrypoint-udpspoofer-testing.sh .
 
 # .env will be mounted by docker-compose (docker.env -> /app/.env)
-ENTRYPOINT ["sleep", "infinity"]
+ENTRYPOINT ["/app/entrypoint-udpspoofer-testing.sh"]
