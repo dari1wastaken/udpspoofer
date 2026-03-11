@@ -144,6 +144,7 @@ func main() {
 
 		var tcpQueue chan netutil.TcpPacket
 		var udpQueue chan netutil.UdpPacket
+		var icmpQueue chan netutil.IcmpPacket
 
 		channelSize := config.GetInt("CHANNEL_SIZE", 100000)
 		l.Info().Int("size", channelSize).Msg("channel size")
@@ -154,25 +155,25 @@ func main() {
 		if synspoofing && udpspoofing {
 			tcpBatchSize = config.GetInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
 			udpBatchSize = config.GetInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 1000)
-			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
+			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp or icmp)"
 		} else if synspoofing {
 			tcpBatchSize = config.GetInt("TCP_REACTIVE_INSERT_BATCH_SIZE", 50000)
 			udpBatchSize = config.GetInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
-			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp)"
+			filter += " and ((tcp and (tcp[tcpflags] & (tcp-rst|tcp-fin) == 0)) or udp or icmp)"
 		} else if udpspoofing {
 			tcpBatchSize = config.GetInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
 			udpBatchSize = config.GetInt("UDP_REACTIVE_INSERT_BATCH_SIZE", 50000)
-			filter += " and (tcp or udp)"
+			filter += " and (tcp or udp or icmp)"
 		} else {
 			tcpBatchSize = config.GetInt("TCP_PASSIVE_INSERT_BATCH_SIZE", 500)
 			udpBatchSize = config.GetInt("UDP_PASSIVE_INSERT_BATCH_SIZE", 100)
-			filter += " and (tcp or udp)"
+			filter += " and (tcp or udp or icmp)"
 		}
 
 		// Actually create DB channels only if saving to Clickhouse
 		if saveClickhouseDB {
 			l.Info().Int("size", tcpBatchSize).Msg("TCP batch size")
-			l.Info().Int("size", udpBatchSize).Msg("UDP batch size")
+			l.Info().Int("size", udpBatchSize).Msg("UDP/ICMP batch size")
 
 			connection, err := db.Connect()
 			if err != nil {
@@ -182,9 +183,11 @@ func main() {
 
 			tcpQueue = make(chan netutil.TcpPacket, channelSize)
 			udpQueue = make(chan netutil.UdpPacket, channelSize)
+			icmpQueue = make(chan netutil.IcmpPacket, channelSize)
 
 			go db.SaveTCPPackets(connection, tcpQueue, tcpBatchSize)
 			go db.SaveUDPPackets(connection, udpQueue, udpBatchSize)
+			go db.SaveICMPPackets(connection, icmpQueue, udpBatchSize)
 		}
 
 		// Open the network interface for packet capture
@@ -224,7 +227,14 @@ func main() {
 				// Only process IPv4
 				ipLayer := packet.Layer(layers.LayerTypeIPv4)
 				if ipLayer != nil {
-					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+
+					if icmpLayer := packet.Layer(layers.LayerTypeICMPv4); icmpLayer != nil {
+						l.Trace().Msg("new ICMP/IPv4 packet read")
+						if saveClickhouseDB {
+							savePackets(packet, tcpQueue, udpQueue, icmpQueue, !PacketBlocked, !ReplySent)
+						}
+
+					} else if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 						l.Trace().Msg("new TCP/IPv4 packet read")
 						if synspoofing {
 							SendSYNACK(packet, packetQueue)
@@ -232,23 +242,24 @@ func main() {
 						if saveClickhouseDB {
 							// For TCP, blocked and replied bools don't matter
 							// TODO: maybe replied can be added, blocked for now not needed
-							savePackets(packet, tcpQueue, udpQueue, false, false)
+							savePackets(packet, tcpQueue, udpQueue, icmpQueue, !PacketBlocked, !ReplySent)
 						}
+
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 						l.Trace().Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
 							udpReplyCode = SendUDPReply(packet, packetQueue, udpLimiter)
 							if saveClickhouseDB {
 								if udpReplyCode == UDP_REPLY_BLOCKED && saveBlockedUDP {
-									savePackets(packet, tcpQueue, udpQueue, PacketBlocked, !ReplySent)
+									savePackets(packet, tcpQueue, udpQueue, icmpQueue, PacketBlocked, !ReplySent)
 								} else if udpReplyCode == UDP_REPLY_SENT {
-									savePackets(packet, tcpQueue, udpQueue, !PacketBlocked, ReplySent)
+									savePackets(packet, tcpQueue, udpQueue, icmpQueue, !PacketBlocked, ReplySent)
 								}
 
 								// UDP_REPLY_ERROR, do not save
 							}
 						} else if saveClickhouseDB {
-							savePackets(packet, tcpQueue, udpQueue, false, false)
+							savePackets(packet, tcpQueue, udpQueue, icmpQueue, !PacketBlocked, !ReplySent)
 						}
 
 					} else {
@@ -267,7 +278,7 @@ func main() {
 }
 
 // Save packet to DB
-func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQueue chan (netutil.UdpPacket), blocked bool, replied bool) {
+func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQueue chan (netutil.UdpPacket), icmpQueue chan (netutil.IcmpPacket), blocked bool, replied bool) {
 	timestamp := packet.Metadata().Timestamp.Unix() * 1000
 	// Get IP layer
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
@@ -354,6 +365,21 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQ
 					staticDropLog.last = now
 				}
 			}
+		} else if icmpLayer := packet.Layer(layers.LayerTypeICMPv4); icmpLayer != nil {
+			icmp, _ := icmpLayer.(*layers.ICMPv4)
+			var icmppacket netutil.IcmpPacket
+
+			// Save IP header to packet
+			icmppacket.IpPacket = ippacket
+
+			icmppacket.Type = icmp.TypeCode.Type()
+			icmppacket.Code = icmp.TypeCode.Code()
+			icmppacket.Checksum = icmp.Checksum
+			icmppacket.Seq = icmp.Seq
+			icmppacket.IcmpId = icmp.Id
+			icmppacket.Payload = b64.StdEncoding.EncodeToString(icmp.Payload)
+
+			icmpQueue <- icmppacket
 		}
 	}
 }
