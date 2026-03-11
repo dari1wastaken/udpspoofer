@@ -25,7 +25,17 @@ var l zl.Logger
 var packetQueue chan []byte
 var staticDropLogSeconds int
 
-const MaxPacketSize = 65536 // Maximum packet size
+const (
+	MaxPacketSize = 65536 // Maximum packet size
+
+	// Constants to call savePackets and keep track of replies and blocked traffic
+	// !PacketBlocked && !ReplySent: no udpspoofing, baseline collection
+	// !PacketBlocked && ReplySent: udpspoofing effective
+	// PacketBlocked && !ReplySent: udpspoofing, but rate limiting applied to packet
+	// PacketBlocked && ReplySent: THIS should not happen
+	PacketBlocked = true
+	ReplySent     = true
+)
 
 func main() {
 	app := cli.NewApp()
@@ -219,23 +229,31 @@ func main() {
 						if synspoofing {
 							SendSYNACK(packet, packetQueue)
 						}
+						if saveClickhouseDB {
+							// For TCP, blocked and replied bools don't matter
+							// TODO: maybe replied can be added, blocked for now not needed
+							savePackets(packet, tcpQueue, udpQueue, false, false)
+						}
 					} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 						l.Trace().Msg("new UDP/IPv4 packet read")
 						if udpspoofing {
 							udpReplyCode = SendUDPReply(packet, packetQueue, udpLimiter)
-							if saveClickhouseDB && udpReplyCode == UDP_REPLY_BLOCKED && saveBlockedUDP {
-								savePackets(packet, tcpQueue, udpQueue)
-								continue
+							if saveClickhouseDB {
+								if udpReplyCode == UDP_REPLY_BLOCKED && saveBlockedUDP {
+									savePackets(packet, tcpQueue, udpQueue, PacketBlocked, !ReplySent)
+								} else if udpReplyCode == UDP_REPLY_SENT {
+									savePackets(packet, tcpQueue, udpQueue, !PacketBlocked, ReplySent)
+								}
+
+								// UDP_REPLY_ERROR, do not save
 							}
+						} else if saveClickhouseDB {
+							savePackets(packet, tcpQueue, udpQueue, false, false)
 						}
+
 					} else {
 						// Not saving anything else for now
 						l.Trace().Msg("new OtherProto/IPv4 packet read")
-						continue
-					}
-
-					if saveClickhouseDB {
-						savePackets(packet, tcpQueue, udpQueue)
 					}
 				}
 			}
@@ -249,7 +267,7 @@ func main() {
 }
 
 // Save packet to DB
-func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQueue chan (netutil.UdpPacket)) {
+func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQueue chan (netutil.UdpPacket), blocked bool, replied bool) {
 	timestamp := packet.Metadata().Timestamp.Unix() * 1000
 	// Get IP layer
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
@@ -318,6 +336,8 @@ func savePackets(packet gopacket.Packet, tcpQueue chan (netutil.TcpPacket), udpQ
 
 			var udppacket netutil.UdpPacket
 			udppacket.IpPacket = ippacket
+			udppacket.Blocked = blocked
+			udppacket.Replied = replied
 			udppacket.SrcPort = uint16(udp.SrcPort)
 			udppacket.DstPort = uint16(udp.DstPort)
 			udppacket.Checksum = udp.Checksum
@@ -499,6 +519,7 @@ const (
 	UDP_REPLY_ERROR   int = -1
 	UDP_REPLY_SENT    int = 0
 	UDP_REPLY_BLOCKED int = 1
+	UDP_NO_REPLY      int = 2 // no udpspoofing
 )
 
 // Take the incoming UDP packet, and reply with the values from the packet. Assumes packet is IPv4

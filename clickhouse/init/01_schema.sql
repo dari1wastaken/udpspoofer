@@ -19,7 +19,9 @@ CREATE TABLE test.udppackets
     SrcPort UInt16 CODEC(Delta(2), ZSTD(1)),
     DstPort UInt16 CODEC(Delta(2), ZSTD(1)),
     UDPLength UInt16 CODEC(Delta(2), ZSTD(1)),
-    Payload String CODEC(ZSTD(1))
+    Payload String CODEC(ZSTD(1)),
+    Blocked Bool CODEC(Delta(1), ZSTD(1)),
+    Replied Bool CODEC(Delta(1), ZSTD(1))
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(Timestamp)

@@ -11,4 +11,4 @@ RUN apt install -y libpcap-dev
 
 RUN CGO_ENABLED=1 go build -o godocker ./cmd/udpspoofer/
 
-CMD [ “” ]
+CMD [ "sleep", "1" ]

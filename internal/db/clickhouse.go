@@ -133,6 +133,8 @@ func SaveUDPPackets(conn driver.Conn, udpQueue chan (netutil.UdpPacket), batchSi
 			pkt.DstPort,
 			pkt.UDPLength,
 			pkt.Payload,
+			pkt.Blocked,
+			pkt.Replied,
 		)
 		if err != nil {
 			l.Error().Err(err).Msg("ERROR in batching UDPPacket")
