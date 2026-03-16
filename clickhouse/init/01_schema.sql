@@ -3,7 +3,7 @@
 CREATE DATABASE IF NOT EXISTS test;
 
 -- UDP packets table
-CREATE TABLE test.udppackets
+CREATE TABLE IF NOT EXISTS test.udppackets
 (
     Timestamp DateTime64(0, 'Europe/Amsterdam') CODEC(Delta(8), ZSTD(1)),
     SrcIP UInt32 CODEC(Delta(4), ZSTD(1)),
@@ -16,6 +16,7 @@ CREATE TABLE test.udppackets
     FragOffset UInt16 CODEC(Delta(2), ZSTD(1)),
     TTL UInt8 CODEC(Delta(1), ZSTD(1)),
     Protocol UInt8 CODEC(Delta(1), ZSTD(1)),
+
     SrcPort UInt16 CODEC(Delta(2), ZSTD(1)),
     DstPort UInt16 CODEC(Delta(2), ZSTD(1)),
     UDPLength UInt16 CODEC(Delta(2), ZSTD(1)),
@@ -31,7 +32,7 @@ SETTINGS index_granularity = 8192
 COMMENT 'Main Packet table containing UDP packet fields';
 
 
-CREATE TABLE test.tcppackets
+CREATE TABLE IF NOT EXISTS test.tcppackets
    (
        Timestamp DateTime64(0, 'Europe/Amsterdam') CODEC(Delta(8), ZSTD(1)),
        SrcIP UInt32 CODEC(Delta(4), ZSTD(1)),
@@ -44,6 +45,7 @@ CREATE TABLE test.tcppackets
        FragOffset UInt16 CODEC(Delta(2), ZSTD(1)),
        TTL UInt8 CODEC(Delta(1), ZSTD(1)),
        Protocol UInt8 CODEC(Delta(1), ZSTD(1)),
+
        SrcPort UInt16 CODEC(Delta(2), ZSTD(1)),
        DstPort UInt16 CODEC(Delta(2), ZSTD(1)),
        Seq UInt32 CODEC(LZ4),
@@ -68,4 +70,30 @@ CREATE TABLE test.tcppackets
    PRIMARY KEY (DstPort, toStartOfDay(Timestamp), SrcIP)
    ORDER BY (DstPort, toStartOfDay(Timestamp), SrcIP, DstIP)
    SETTINGS index_granularity = 8192
-   COMMENT 'Main Packet table containing TCP packet fields'
+   COMMENT 'Main Packet table containing TCP packet fields';
+
+
+
+CREATE TABLE IF NOT EXISTS test.icmppackets (
+    Timestamp DateTime64(0, 'Europe/Amsterdam') CODEC(Delta(8), ZSTD(1)),
+    SrcIP UInt32 CODEC(Delta(4), ZSTD(1)),
+    DstIP UInt32 CODEC(Delta(4), ZSTD(1)),
+    IHL UInt8 CODEC(Delta(1), ZSTD(1)),
+    TOS UInt8 CODEC(Delta(1), ZSTD(1)),
+    Length UInt16 CODEC(Delta(2), ZSTD(1)),
+    IPId UInt16 CODEC(Delta(2), ZSTD(1)),
+    Flags UInt8 CODEC(Delta(1), ZSTD(1)),
+    FragOffset UInt16 CODEC(Delta(2), ZSTD(1)),
+    TTL UInt8 CODEC(Delta(1), ZSTD(1)),
+    Protocol UInt8 CODEC(Delta(1), ZSTD(1)),
+
+    Type UInt8 CODEC(Delta(1), ZSTD(1)),
+    Code UInt8 CODEC(Delta(1), ZSTD(1)),
+    IcmpID UInt16 CODEC(Delta(2), ZSTD(1)),
+    Seq UInt16 CODEC(Delta(2), ZSTD(1)),
+    Payload String CODEC(ZSTD(1))
+) ENGINE = MergeTree 
+PRIMARY KEY (SrcIP, toStartOfDay(Timestamp))
+ORDER BY (SrcIP, toStartOfDay(Timestamp), DstIP)
+PARTITION BY toYYYYMM(Timestamp)
+COMMENT 'Main Packet table containing ICMP packet fields';

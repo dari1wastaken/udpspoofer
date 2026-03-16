@@ -51,3 +51,11 @@ type UdpPacket struct {
 	UDPChecksum      uint16
 	Payload          string
 }
+
+type IcmpPacket struct {
+	IpPacket
+	Type, Code   uint8
+	ICMPChecksum uint16
+	Seq, IcmpId  uint16
+	Payload      string
+}

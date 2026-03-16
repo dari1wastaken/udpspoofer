@@ -232,3 +232,80 @@ func SaveTCPPackets(conn driver.Conn, tcpQueue chan (netutil.TcpPacket), batchSi
 		inBatch++
 	}
 }
+
+func SaveICMPPackets(conn driver.Conn, icmpQueue chan (netutil.IcmpPacket), batchSize int) {
+
+	l := log.Logger()
+
+	current, err := prepareBatch(conn, "icmppackets")
+	if err != nil {
+		l.Fatal().Err(err).Msg("Error preparing ICMP batch")
+	}
+	l.Info().Msg("ICMP batch created...")
+
+	inBatch := 0
+
+	flush := func() {
+		if inBatch == 0 {
+			return
+		}
+		l.Info().Str("proto", "icmp").Int("batch_size", inBatch).Msg("saving batch to clickhouse")
+		if err := current.Send(); err != nil {
+			l.Error().Err(err).Msg("icmp batch send error")
+			// Drop the batch and try to recreate on next packet.
+		}
+
+		current, err = prepareBatch(conn, "icmppackets")
+		if err != nil {
+			l.Error().Err(err).Msg("icmp prepare new batch error")
+			current = nil
+		} else {
+			l.Debug().Msg("prepare new ICMP batch after send")
+		}
+		inBatch = 0
+	}
+
+	for {
+		pkt := <-icmpQueue
+		if pkt.Flush || inBatch >= batchSize {
+			flush()
+			if pkt.Flush {
+				continue
+			}
+		}
+
+		if current == nil {
+			current, err = prepareBatch(conn, "icmppackets")
+			if err != nil {
+				l.Error().Err(err).Msg("icmp re-prepare batch error; will retry on next packet")
+				continue
+			}
+			l.Debug().Msg("prepared new ICMP batch after previous error")
+		}
+
+		err = current.Append(
+			pkt.Timestamp,
+			pkt.SrcIP,
+			pkt.DstIP,
+			pkt.IHL,
+			pkt.TOS,
+			pkt.Length,
+			pkt.IpId,
+			pkt.Flags,
+			pkt.FragOffset,
+			pkt.TTL,
+			pkt.Protocol,
+
+			pkt.Type,
+			pkt.Code,
+			pkt.IcmpId,
+			pkt.Seq,
+			pkt.Payload,
+		)
+		if err != nil {
+			l.Error().Err(err).Msg("ERROR in batching ICMPPacket")
+			continue
+		}
+		inBatch++
+	}
+}
