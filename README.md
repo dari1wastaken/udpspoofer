@@ -1,12 +1,17 @@
 # UDP/TCP Reactive Telescope
 
+RT-UDP, a.k.a. `udpspoofer`
 - Listens on the given interface for IPv4 packets (TCP and UDP supported)
 - Crafts stateless valid replies and sends them back to scanners through the same interface
     - TCP: `SYN` --> `SYN-ACK`; `ACK [+ Data]` --> `ACK`; `RST/FIN` dropped to elicit more interaction
     - UDP: `UDP [+ Data]` --> `UDP [Empty]`
 - Saves (only) incoming traffic to the configured Clickhouse database tables for UDP and TCP (schemas under `clickhouse/init`)
 
-## udpspoofer
+## Dataset
+
+If you are looking for our traffic dataset, you can find it here: https://delftintellab.com/projects/imc2026-udp-reactive
+
+## Tool
 
 #### Build
 
